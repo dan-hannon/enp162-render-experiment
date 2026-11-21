@@ -1,0 +1,1 @@
+{"name":"enp162-render-experiment","version":"0.1.0","private":true,"type":"module","scripts":{"start":"node render_server.js"},"dependencies":{"ws":"^8.18.0","firebase-admin":"^13.0.0"},"engines":{"node":">=20"}}
