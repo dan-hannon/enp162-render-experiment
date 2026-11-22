@@ -200,15 +200,27 @@ wss.on('connection', (ws,req)=>{
       const payload={station,session:m.session,tier:m.tier,batch:m.batch,samples:m.samples,
         deviceSentMs:m.deviceSentMs??null,serverReceivedMs:receivedMs,serverWrittenMs:null};
       pending.set(key,{key,station,session:m.session,tier:m.tier,batch:m.batch,samples:m.samples.length,payload,receivedMs,attempts:0,nextAttemptMs:0});
+      // A valid accepted batch establishes the session even when the device
+      // has not yet emitted recording_event (legacy or reconnecting firmware).
+      // Do not infer authoritative completion or device sample losses here.
       const state=recordingStatus.get(station);
-      if(state?.session===m.session)reportRecording(station,{receivedSamples:state.receivedSamples+m.samples.length,receivedBatches:state.receivedBatches+1,queuedBatches:queueSnapshot(station)});
+      if(!state || state.session!==m.session){
+        reportRecording(station,{session:m.session,tier:m.tier,state:'receiving',
+          durationMs:null,startedMs:null,receivedSamples:m.samples.length,
+          persistedSamples:0,receivedBatches:1,persistedBatches:0,
+          failedAttempts:0,queuedBatches:queueSnapshot(station),
+          deviceSamples:null,deviceLost:null});
+      }else{
+        reportRecording(station,{receivedSamples:state.receivedSamples+m.samples.length,
+          receivedBatches:state.receivedBatches+1,queuedBatches:queueSnapshot(station)});
+      }
       send(ws,{type:'ack',session:m.session,tier:m.tier,batch:m.batch,receivedMs,acceptedMs:Date.now(),persistence:'queued'});
       emitToDashboards({type:'batch_received',station,session:m.session,tier:m.tier,batch:m.batch,count:m.samples.length,receivedMs});
       startWorker();
     } else if (role==='device' && m.type==='recording_event' && m.station===station && safeId(m.session) && [1,2,3].includes(m.tier) && ['started','draining','completed'].includes(m.state)) {
       const old=recordingStatus.get(station);
-      if(m.state==='started' || old?.session!==m.session)reportRecording(station,{session:m.session,tier:m.tier,state:m.state,durationMs:m.durationMs??null,startedMs:Date.now(),receivedSamples:0,persistedSamples:0,receivedBatches:0,persistedBatches:0,failedAttempts:0,queuedBatches:queueSnapshot(station),deviceSamples:null,deviceLost:null});
-      else reportRecording(station,{state:m.state,deviceSamples:m.samples??old.deviceSamples,deviceLost:m.lost??old.deviceLost,queuedBatches:queueSnapshot(station)});
+      if(old?.session!==m.session)reportRecording(station,{session:m.session,tier:m.tier,state:m.state,durationMs:m.durationMs??null,startedMs:Date.now(),receivedSamples:0,persistedSamples:0,receivedBatches:0,persistedBatches:0,failedAttempts:0,queuedBatches:queueSnapshot(station),deviceSamples:null,deviceLost:null});
+      else reportRecording(station,{state:m.state,startedMs:old.startedMs??Date.now(),durationMs:m.durationMs??old.durationMs,deviceSamples:m.state==='completed'?m.samples:(old.deviceSamples??null),deviceLost:m.state==='completed'?m.lost:(old.deviceLost??null),queuedBatches:queueSnapshot(station)});
     } else if (role==='device' && m.type==='diag' && m.station===station) {
       process.stdout.write(JSON.stringify({event:'device_diag',station,serverMs:Date.now(),data:m})+'\n');
       emitToDashboards({type:'diag',station,serverMs:Date.now(),data:m});
