@@ -13,6 +13,71 @@ if (!deviceToken || !dashboardToken || !dbUrl || !sa) {
 }
 admin.initializeApp({credential:admin.credential.cert(JSON.parse(sa)), databaseURL:dbUrl});
 const db = admin.database();
+
+// v0.16: Read-only, authenticated recording discovery and bounded retrieval.
+// The existing recording/persistence pipeline is intentionally unchanged.
+const SERVER_REVISION='v0.16';
+const MAX_LIST_SESSIONS=150;
+const MAX_PAGE_BATCHES=20;
+const MAX_PAGE_SAMPLES=2000;
+function recordingRoot(station,session,tier){return `experimentalRecordings/${station}/${session}/tier${tier}`;}
+async function shallowKeys(path){
+  // RTDB Admin SDK has no shallow listing; authenticated REST avoids downloading
+  // entire multi-hour recordings just to discover their keys.
+  const credential=admin.app().options.credential;
+  const access=await credential.getAccessToken();
+  const url=`${dbUrl.replace(/\/$/,'')}/${path}.json?shallow=true`;
+  const response=await fetch(url,{headers:{Authorization:`Bearer ${access.access_token}`},signal:AbortSignal.timeout(15000)});
+  if(!response.ok)throw new Error(`Firebase key listing HTTP ${response.status}`);
+  const obj=await response.json();
+  return obj && typeof obj==='object' && !Array.isArray(obj)?Object.keys(obj):[];
+}
+async function listRecordings(station){
+  const sessions=(await shallowKeys(`experimentalRecordings/${station}`)).filter(safeId);
+  if(sessions.length>MAX_LIST_SESSIONS)throw new Error(`Too many sessions (${sessions.length}) for bounded discovery; use session ID lookup`);
+  const output=[];
+  // Limit concurrent Firebase operations; do not read the full sample payload.
+  for(let i=0;i<sessions.length;i+=6){
+    const group=await Promise.all(sessions.slice(i,i+6).map(async session=>{
+      const entries=[];
+      try{
+        const tierNames=await shallowKeys(`experimentalRecordings/${station}/${session}`);
+        for(const tierName of tierNames){
+          if(!/^tier[123]$/.test(tierName))continue;
+          const tier=Number(tierName.slice(4));
+          const root=recordingRoot(station,session,tier);
+          const snap=await db.ref(`${root}/batches/b00000000`).once('value');
+          const first=snap.val();
+          if(!first || !Array.isArray(first.samples))continue;
+          const time=Number(first.serverReceivedMs)||Number(first.deviceSentMs)||null;
+          entries.push({station,session,tier,recordedMs:time,
+            label:time?new Date(time).toISOString():`Undated recording (${session})`,
+            firstBatchSamples:first.samples.length});
+        }
+      }catch(e){console.error('recording_discovery_skipped',station,session,String(e));}
+      return entries;
+    }));
+    for(const entries of group)output.push(...entries);
+  }
+  output.sort((a,b)=>(b.recordedMs||0)-(a.recordedMs||0));
+  return output;
+}
+async function recordingPage(station,session,tier,afterBatch,limit){
+  const root=recordingRoot(station,session,tier);
+  const take=Math.min(MAX_PAGE_BATCHES,Math.max(1,Number(limit)||10));
+  let query=db.ref(`${root}/batches`).orderByKey();
+  if(afterBatch!==null){
+    if(!Number.isInteger(afterBatch)||afterBatch<0||afterBatch>10000000)throw new Error('invalid batch cursor');
+    query=query.startAt(`b${String(afterBatch+1).padStart(8,'0')}`);
+  }
+  const snap=await query.limitToFirst(take+1).once('value');
+  const items=Object.entries(snap.val()||{}).sort(([a],[b])=>a.localeCompare(b));
+  const hasMore=items.length>take;
+  const page=items.slice(0,take).map(([key,b])=>({batch:Number(key.slice(1)),...b}));
+  if(page.some(b=>!Array.isArray(b.samples)) || page.reduce((n,b)=>n+b.samples.length,0)>MAX_PAGE_SAMPLES)throw new Error('invalid or oversized recording page');
+  return {station,session,tier,batches:page,nextBatch:hasMore?page.at(-1).batch:null,hasMore};
+}
+
 const server = http.createServer((req,res)=>{
   if (req.url === '/health') {res.writeHead(200,{'content-type':'application/json'});res.end(JSON.stringify({ok:true}));return;}
   res.writeHead(404);res.end();
@@ -146,6 +211,16 @@ wss.on('connection', (ws,req)=>{
       send(ws,{type:'hello_ack',serverMs:Date.now()});if(role==='dashboard')for(const status of recordingStatus.values())send(ws,{type:'recording_status',...status});return;
     }
     if (role==='dashboard') {
+      if(m.type==='list_recordings' && safeId(m.station)){
+        void listRecordings(m.station).then(records=>send(ws,{type:'recordings_list',station:m.station,requestId:m.requestId??null,records}))
+          .catch(e=>send(ws,{type:'recordings_error',requestId:m.requestId??null,error:String(e.message||e).slice(0,180)}));return;
+      }
+      if(m.type==='get_recording_page' && safeId(m.station) && safeId(m.session) && [1,2,3].includes(m.tier)){
+        const after=m.afterBatch===null||m.afterBatch===undefined?null:Number(m.afterBatch);
+        void recordingPage(m.station,m.session,m.tier,after,m.limit)
+          .then(page=>send(ws,{type:'recording_page',requestId:m.requestId??null,...page}))
+          .catch(e=>send(ws,{type:'recordings_error',requestId:m.requestId??null,error:String(e.message||e).slice(0,180)}));return;
+      }
       if(m.type==='get_recording_status' && safeId(m.station)){send(ws,{type:'recording_status',...(recordingStatus.get(m.station)||{station:m.station,state:'unknown',queuedBatches:queueSnapshot(m.station)})});return;}
       if(m.type==='set_detector' && safeId(m.station) && validDetector(m.detector)) {
         const d=m.detector;
@@ -228,4 +303,4 @@ wss.on('connection', (ws,req)=>{
   });
   ws.on('close',()=>{if(role==='dashboard') dashboards.delete(ws);if(role==='device'&&devices.get(station)===ws)devices.delete(station);});
 });
-server.listen(PORT,()=>process.stdout.write(`ENP162 experimental relay listening on ${PORT}\n`));
+server.listen(PORT,()=>process.stdout.write(`ENP162 experimental relay ${SERVER_REVISION} listening on ${PORT}\n`));
