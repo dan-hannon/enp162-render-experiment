@@ -73,8 +73,65 @@ function validBatch(m) {
     && Array.isArray(m.samples) && m.samples.length>0 && m.samples.length<=100
     && m.samples.every(s=>s && Number.isSafeInteger(s.seq) && s.seq>=0 && Number.isFinite(s.ms));
 }
+// Bounded, process-local persistence queue. Receipt ACK means accepted into this
+// volatile queue, NOT durable Firebase persistence. Restart-loss risk is explicit.
+const MAX_PENDING_BATCHES=256;
+const pending=new Map();
+const persisted=new Map(); // bounded dedup cache; Firebase paths are also idempotent
+const MAX_PERSISTED_CACHE=4096;
+const recordingStatus=new Map();
+let workerActive=false;
+function batchKey(m){return `${m.station}/${m.session}/${m.tier}/${m.batch}`;}
+function reportRecording(station, patch){
+  const previous=recordingStatus.get(station)||{station,receivedSamples:0,persistedSamples:0,receivedBatches:0,persistedBatches:0,failedAttempts:0};
+  const next={...previous,...patch,station,serverMs:Date.now()};
+  recordingStatus.set(station,next);
+  emitToDashboards({type:'recording_status',...next});
+}
+function queueSnapshot(station){
+  let queued=0;
+  for(const item of pending.values())if(item.station===station)queued++;
+  return queued;
+}
+function startWorker(){
+  if(workerActive)return;
+  workerActive=true;
+  const pump=async()=>{
+    try{
+      while(pending.size){
+        const now=Date.now();
+        let item=null, earliest=Infinity;
+        for(const candidate of pending.values()){
+          if(candidate.nextAttemptMs<=now){item=candidate;break;}
+          earliest=Math.min(earliest,candidate.nextAttemptMs);
+        }
+        if(!item){await new Promise(resolve=>setTimeout(resolve,Math.max(10,Math.min(1000,earliest-now))));continue;}
+        const path=`experimentalRecordings/${item.station}/${item.session}/tier${item.tier}/batches/b${String(item.batch).padStart(8,'0')}`;
+        try{
+          await db.ref(path).set(item.payload);
+          const persistedMs=Date.now();
+          pending.delete(item.key);
+          persisted.set(item.key,persistedMs);
+          if(persisted.size>MAX_PERSISTED_CACHE)persisted.delete(persisted.keys().next().value);
+          const state=recordingStatus.get(item.station);
+          if(state?.session===item.session){reportRecording(item.station,{persistedSamples:state.persistedSamples+item.samples,persistedBatches:state.persistedBatches+1,queuedBatches:queueSnapshot(item.station)});}
+          emitToDashboards({type:'batch_persisted',station:item.station,session:item.session,tier:item.tier,batch:item.batch,count:item.samples,persistedMs});
+          process.stdout.write(JSON.stringify({event:'stored',station:item.station,session:item.session,tier:item.tier,batch:item.batch,count:item.samples,receivedMs:item.receivedMs,persistedMs,storeMs:persistedMs-item.receivedMs})+'\n');
+        }catch(e){
+          item.attempts++;
+          item.nextAttemptMs=Date.now()+Math.min(30000,500*2**Math.min(item.attempts,6));
+          const state=recordingStatus.get(item.station);
+          if(state?.session===item.session)reportRecording(item.station,{failedAttempts:state.failedAttempts+1,queuedBatches:queueSnapshot(item.station),lastPersistenceError:String(e).slice(0,180)});
+          emitToDashboards({type:'batch_retry',station:item.station,session:item.session,tier:item.tier,batch:item.batch,attempt:item.attempts,nextAttemptMs:item.nextAttemptMs});
+          process.stderr.write(JSON.stringify({event:'persist_retry',station:item.station,session:item.session,batch:item.batch,attempt:item.attempts,error:String(e)})+'\n');
+        }
+      }
+    }finally{workerActive=false;if(pending.size)startWorker();}
+  };
+  void pump();
+}
 wss.on('connection', (ws,req)=>{
-  let role=null, station=null, queue=Promise.resolve(), authenticated=false;
+  let role=null, station=null, authenticated=false;
   ws.on('message',raw=>{
     let m; try {m=JSON.parse(raw.toString());} catch {send(ws,{type:'error',error:'invalid_json'});return;}
     if (!authenticated) {
@@ -86,9 +143,10 @@ wss.on('connection', (ws,req)=>{
       } else if(m.role==='dashboard' && tokenEq(m.token,dashboardToken)) {
         authenticated=true;role='dashboard';dashboards.add(ws);
       } else {ws.close(1008,'unauthorized');return;}
-      send(ws,{type:'hello_ack',serverMs:Date.now()});return;
+      send(ws,{type:'hello_ack',serverMs:Date.now()});if(role==='dashboard')for(const status of recordingStatus.values())send(ws,{type:'recording_status',...status});return;
     }
     if (role==='dashboard') {
+      if(m.type==='get_recording_status' && safeId(m.station)){send(ws,{type:'recording_status',...(recordingStatus.get(m.station)||{station:m.station,state:'unknown',queuedBatches:queueSnapshot(m.station)})});return;}
       if(m.type==='set_detector' && safeId(m.station) && validDetector(m.detector)) {
         const d=m.detector;
         db.ref(`experimentalDetectors/${m.station}`).set(d).then(()=>{
@@ -106,6 +164,7 @@ wss.on('connection', (ws,req)=>{
           send(device,{type:'command',action:'rgb',r:m.r,g:m.g,b:m.b});
         }else{
           send(device,{type:'command',action:m.action,tier:m.tier,durationMs:Math.min(m.tier===1?21600000:(m.tier===3?300000:7200000),Math.max(1000,Number(m.durationMs)||300000))});
+          send(ws,{type:'recording_command_sent',station:m.station,action:m.action,serverMs:Date.now()});
         }
       }
       return;
@@ -128,21 +187,28 @@ wss.on('connection', (ws,req)=>{
       // generate stale or duplicate alerts after the live event has passed.
       if(m.tier===2)emitToDashboards({type:'live_batch',station,session:m.session,tier:m.tier,batch:m.batch,
         samples:m.samples,serverReceivedMs:receivedMs,persistence:'pending'});
-      // Serialize Firebase writes for this device; ACK only after RTDB set succeeds.
-      queue=queue.then(async()=>{
-        const path=`experimentalRecordings/${station}/${m.session}/tier${m.tier}/batches/b${String(m.batch).padStart(8,'0')}`;
-        const payload={station,session:m.session,tier:m.tier,batch:m.batch,samples:m.samples,
-          deviceSentMs:m.deviceSentMs??null,serverReceivedMs:receivedMs,serverWrittenMs:Date.now()};
-        await db.ref(path).set(payload);
-        const ackMs=Date.now();
-        send(ws,{type:'ack',session:m.session,tier:m.tier,batch:m.batch,receivedMs,persistedMs:ackMs});
-        emitToDashboards({type:'batch_persisted',station,session:m.session,tier:m.tier,batch:m.batch,persistedMs:ackMs});
-        process.stdout.write(JSON.stringify({event:'stored',station,session:m.session,tier:m.tier,batch:m.batch,
-          count:m.samples.length,receivedMs,persistedMs:ackMs,storeMs:ackMs-receivedMs})+'\n');
-      }).catch(e=>{
-        process.stderr.write(JSON.stringify({event:'persist_error',station,error:String(e)})+'\n');
-        send(ws,{type:'nack',session:m.session,tier:m.tier,batch:m.batch,error:'persistence_failed'});
-      });
+      const key=batchKey(m);
+      if(pending.has(key)||persisted.has(key)){
+        send(ws,{type:'ack',session:m.session,tier:m.tier,batch:m.batch,receivedMs,acceptedMs:Date.now(),persistence:'queued_or_persisted'});
+        return;
+      }
+      if(pending.size>=MAX_PENDING_BATCHES){
+        send(ws,{type:'nack',session:m.session,tier:m.tier,batch:m.batch,error:'server_queue_full'});
+        emitToDashboards({type:'recording_queue_full',station,session:m.session,tier:m.tier,queuedBatches:pending.size});
+        return;
+      }
+      const payload={station,session:m.session,tier:m.tier,batch:m.batch,samples:m.samples,
+        deviceSentMs:m.deviceSentMs??null,serverReceivedMs:receivedMs,serverWrittenMs:null};
+      pending.set(key,{key,station,session:m.session,tier:m.tier,batch:m.batch,samples:m.samples.length,payload,receivedMs,attempts:0,nextAttemptMs:0});
+      const state=recordingStatus.get(station);
+      if(state?.session===m.session)reportRecording(station,{receivedSamples:state.receivedSamples+m.samples.length,receivedBatches:state.receivedBatches+1,queuedBatches:queueSnapshot(station)});
+      send(ws,{type:'ack',session:m.session,tier:m.tier,batch:m.batch,receivedMs,acceptedMs:Date.now(),persistence:'queued'});
+      emitToDashboards({type:'batch_received',station,session:m.session,tier:m.tier,batch:m.batch,count:m.samples.length,receivedMs});
+      startWorker();
+    } else if (role==='device' && m.type==='recording_event' && m.station===station && safeId(m.session) && [1,2,3].includes(m.tier) && ['started','draining','completed'].includes(m.state)) {
+      const old=recordingStatus.get(station);
+      if(m.state==='started' || old?.session!==m.session)reportRecording(station,{session:m.session,tier:m.tier,state:m.state,durationMs:m.durationMs??null,startedMs:Date.now(),receivedSamples:0,persistedSamples:0,receivedBatches:0,persistedBatches:0,failedAttempts:0,queuedBatches:queueSnapshot(station),deviceSamples:null,deviceLost:null});
+      else reportRecording(station,{state:m.state,deviceSamples:m.samples??old.deviceSamples,deviceLost:m.lost??old.deviceLost,queuedBatches:queueSnapshot(station)});
     } else if (role==='device' && m.type==='diag' && m.station===station) {
       process.stdout.write(JSON.stringify({event:'device_diag',station,serverMs:Date.now(),data:m})+'\n');
       emitToDashboards({type:'diag',station,serverMs:Date.now(),data:m});
