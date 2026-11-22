@@ -20,6 +20,42 @@ const server = http.createServer((req,res)=>{
 const wss = new WebSocketServer({server, maxPayload:128*1024, perMessageDeflate:false});
 const devices = new Map();
 const dashboards = new Set();
+// Per-station detector state. Configuration is persisted in experimental RTDB.
+const detectors = new Map();
+const allowedSignals = new Set(['x','y','z','sound','pir','sw','button']);
+function validDetector(d) {
+  return d && typeof d.enabled==='boolean' && allowedSignals.has(d.signal)
+    && Number.isFinite(d.threshold) && Math.abs(d.threshold)<=100000
+    && ['above','below'].includes(d.operator)
+    && Number.isInteger(d.cooldownMs) && d.cooldownMs>=500 && d.cooldownMs<=600000
+    && Array.isArray(d.rgb) && d.rgb.length===3
+    && d.rgb.every(x=>Number.isInteger(x)&&x>=0&&x<=255);
+}
+function evaluate(station,sample) {
+  const entry=detectors.get(station);
+  if(!entry?.enabled || !sample || !Number.isFinite(sample[entry.signal]))return;
+  const value=sample[entry.signal];
+  const active=entry.operator==='above'?value>entry.threshold:value<entry.threshold;
+  const now=Date.now();
+  // Edge-triggered; cooldown prevents repeated flashing during sustained events.
+  if(active && !entry.wasActive && now-entry.lastAlert>=entry.cooldownMs){
+    entry.lastAlert=now;
+    const event={type:'detector_alert',station,signal:entry.signal,value,
+      threshold:entry.threshold,operator:entry.operator,serverMs:now,sampleSeq:sample.seq??null};
+    emitToDashboards(event);
+    const device=devices.get(station);
+    if(device)send(device,{type:'command',action:'alert_rgb',r:entry.rgb[0],g:entry.rgb[1],b:entry.rgb[2],durationMs:1500});
+    db.ref(`experimentalAlerts/${station}`).push(event).catch(e=>console.error('alert_write_failed',String(e)));
+  }
+  entry.wasActive=active;
+}
+// Reload saved rules after service restart; alert history stays in Firebase.
+db.ref('experimentalDetectors').once('value').then(snap=>{
+  const all=snap.val()||{};
+  for(const [station,d] of Object.entries(all))if(safeId(station)&&validDetector(d))
+    detectors.set(station,{...d,wasActive:false,lastAlert:0});
+}).catch(e=>console.error('detector_load_failed',String(e)));
+
 const safeId = s => typeof s === 'string' && /^[A-Za-z0-9_-]{1,48}$/.test(s);
 const tokenEq = (a,b) => {
   if (typeof a !== 'string' || typeof b !== 'string') return false;
@@ -53,16 +89,31 @@ wss.on('connection', (ws,req)=>{
       send(ws,{type:'hello_ack',serverMs:Date.now()});return;
     }
     if (role==='dashboard') {
-      if(m.type==='command' && safeId(m.station) && ['start','stop'].includes(m.action) && [1,2,3].includes(m.tier)) {
+      if(m.type==='set_detector' && safeId(m.station) && validDetector(m.detector)) {
+        const d=m.detector;
+        db.ref(`experimentalDetectors/${m.station}`).set(d).then(()=>{
+          detectors.set(m.station,{...d,wasActive:false,lastAlert:0});
+          send(ws,{type:'detector_saved',station:m.station,detector:d});
+        }).catch(()=>send(ws,{type:'error',error:'detector_save_failed'}));
+        return;
+      }
+
+      if(m.type==='command' && safeId(m.station) && ['start','stop','rgb'].includes(m.action) && [1,2,3].includes(m.tier)) {
         const device=devices.get(m.station);
         if(!device || device.readyState!==WebSocket.OPEN) {send(ws,{type:'error',error:'device_offline'});return;}
-        send(device,{type:'command',action:m.action,tier:m.tier,durationMs:Math.min(m.tier===1?21600000:(m.tier===3?300000:7200000),Math.max(1000,Number(m.durationMs)||300000))});
+        if(m.action==='rgb'){
+          if(![m.r,m.g,m.b].every(x=>Number.isInteger(x)&&x>=0&&x<=255)){send(ws,{type:'error',error:'invalid_rgb'});return;}
+          send(device,{type:'command',action:'rgb',r:m.r,g:m.g,b:m.b});
+        }else{
+          send(device,{type:'command',action:m.action,tier:m.tier,durationMs:Math.min(m.tier===1?21600000:(m.tier===3?300000:7200000),Math.max(1000,Number(m.durationMs)||300000))});
+        }
       }
       return;
     }
     if (role==='device' && m.type==='live_sample') {
-      if (m.station===station && [1,3].includes(m.tier) && safeId(m.session) && m.sample && Number.isSafeInteger(m.sample.seq)) {
+      if (m.station===station && [0,1,3].includes(m.tier) && safeId(m.session) && m.sample && Number.isSafeInteger(m.sample.seq)) {
         emitToDashboards({type:'live_sample',station,session:m.session,tier:m.tier,sample:m.sample,serverReceivedMs:Date.now()});
+        evaluate(station,m.sample);
       }
       return;
     }
@@ -72,6 +123,9 @@ wss.on('connection', (ws,req)=>{
       // Forward to live dashboard on receipt, without waiting for Firebase.
       // Tier 1 and Tier 3 already forward individual live samples.
       // Tier 2 forwards completed batches; no duplicate live forwarding.
+      // Detection uses the independent 10 Hz live_sample stream for every tier.
+      // Do not re-evaluate delayed Tier 2 recording batches: doing so could
+      // generate stale or duplicate alerts after the live event has passed.
       if(m.tier===2)emitToDashboards({type:'live_batch',station,session:m.session,tier:m.tier,batch:m.batch,
         samples:m.samples,serverReceivedMs:receivedMs,persistence:'pending'});
       // Serialize Firebase writes for this device; ACK only after RTDB set succeeds.
