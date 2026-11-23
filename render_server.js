@@ -16,7 +16,7 @@ const db = admin.database();
 
 // v0.16: Read-only, authenticated recording discovery and bounded retrieval.
 // The existing recording/persistence pipeline is intentionally unchanged.
-const SERVER_REVISION='v0.16';
+const SERVER_REVISION='v0.17';
 const MAX_LIST_SESSIONS=150;
 const MAX_PAGE_BATCHES=20;
 const MAX_PAGE_SAMPLES=2000;
@@ -287,7 +287,7 @@ wss.on('connection', (ws,req)=>{
           failedAttempts:0,queuedBatches:queueSnapshot(station),
           deviceSamples:null,deviceLost:null});
       }else{
-        reportRecording(station,{receivedSamples:state.receivedSamples+m.samples.length,
+        reportRecording(station,{state:state.state==='started'?'receiving':state.state,receivedSamples:state.receivedSamples+m.samples.length,
           receivedBatches:state.receivedBatches+1,queuedBatches:queueSnapshot(station)});
       }
       send(ws,{type:'ack',session:m.session,tier:m.tier,batch:m.batch,receivedMs,acceptedMs:Date.now(),persistence:'queued'});
@@ -296,7 +296,13 @@ wss.on('connection', (ws,req)=>{
     } else if (role==='device' && m.type==='recording_event' && m.station===station && safeId(m.session) && [1,2,3].includes(m.tier) && ['started','draining','completed'].includes(m.state)) {
       const old=recordingStatus.get(station);
       if(old?.session!==m.session)reportRecording(station,{session:m.session,tier:m.tier,state:m.state,durationMs:m.durationMs??null,startedMs:Date.now(),receivedSamples:0,persistedSamples:0,receivedBatches:0,persistedBatches:0,failedAttempts:0,queuedBatches:queueSnapshot(station),deviceSamples:null,deviceLost:null});
-      else if(old.state!=='completed' || m.state==='completed')reportRecording(station,{state:m.state,startedMs:old.startedMs??Date.now(),durationMs:m.durationMs??old.durationMs,deviceSamples:m.state==='completed'?m.samples:(old.deviceSamples??null),deviceLost:m.state==='completed'?m.lost:(old.deviceLost??null),queuedBatches:queueSnapshot(station)});
+      else if(old.state!=='completed' || m.state==='completed'){
+        // A reconnect may replay 'started' after batches arrived or after draining began.
+        // Never move an existing session backward in its lifecycle.
+        const rank={started:1,receiving:2,draining:3,completed:4};
+        const nextState=(rank[m.state]||0)>=(rank[old.state]||0)?m.state:old.state;
+        reportRecording(station,{state:nextState,startedMs:old.startedMs??Date.now(),durationMs:m.durationMs??old.durationMs,deviceSamples:m.state==='completed'?m.samples:(old.deviceSamples??null),deviceLost:m.state==='completed'?m.lost:(old.deviceLost??null),queuedBatches:queueSnapshot(station)});
+      }
       // Completion acknowledgement is explicit; the ES may retry safely.
       if(m.state==='completed'){
         if(m.tier===3 && m.transportDiag && typeof m.transportDiag==='object'){
