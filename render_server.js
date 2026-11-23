@@ -295,7 +295,9 @@ wss.on('connection', (ws,req)=>{
     } else if (role==='device' && m.type==='recording_event' && m.station===station && safeId(m.session) && [1,2,3].includes(m.tier) && ['started','draining','completed'].includes(m.state)) {
       const old=recordingStatus.get(station);
       if(old?.session!==m.session)reportRecording(station,{session:m.session,tier:m.tier,state:m.state,durationMs:m.durationMs??null,startedMs:Date.now(),receivedSamples:0,persistedSamples:0,receivedBatches:0,persistedBatches:0,failedAttempts:0,queuedBatches:queueSnapshot(station),deviceSamples:null,deviceLost:null});
-      else reportRecording(station,{state:m.state,startedMs:old.startedMs??Date.now(),durationMs:m.durationMs??old.durationMs,deviceSamples:m.state==='completed'?m.samples:(old.deviceSamples??null),deviceLost:m.state==='completed'?m.lost:(old.deviceLost??null),queuedBatches:queueSnapshot(station)});
+      else if(old.state!=='completed' || m.state==='completed')reportRecording(station,{state:m.state,startedMs:old.startedMs??Date.now(),durationMs:m.durationMs??old.durationMs,deviceSamples:m.state==='completed'?m.samples:(old.deviceSamples??null),deviceLost:m.state==='completed'?m.lost:(old.deviceLost??null),queuedBatches:queueSnapshot(station)});
+      // Completion acknowledgement is explicit; the ES may retry safely.
+      if(m.state==='completed')send(ws,{type:'recording_event_ack',station,session:m.session,tier:m.tier,state:'completed'});
     } else if (role==='device' && m.type==='diag' && m.station===station) {
       process.stdout.write(JSON.stringify({event:'device_diag',station,serverMs:Date.now(),data:m})+'\n');
       emitToDashboards({type:'diag',station,serverMs:Date.now(),data:m});
