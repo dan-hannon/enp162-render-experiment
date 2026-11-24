@@ -16,7 +16,7 @@ const db = admin.database();
 
 // v0.16: Read-only, authenticated recording discovery and bounded retrieval.
 // The existing recording/persistence pipeline is intentionally unchanged.
-const SERVER_REVISION='v0.17';
+const SERVER_REVISION='v0.18_TRANSPORT_DIAGNOSTICS';
 const MAX_LIST_SESSIONS=150;
 const MAX_PAGE_BATCHES=20;
 const MAX_PAGE_SAMPLES=2000;
@@ -129,9 +129,19 @@ const tokenEq = (a,b) => {
 };
 function emitToDashboards(obj) {
   const payload=JSON.stringify(obj);
-  for (const ws of dashboards) if(ws.readyState===WebSocket.OPEN && ws.bufferedAmount<256*1024) ws.send(payload);
+  for (const ws of dashboards) if(ws.readyState===WebSocket.OPEN && ws.bufferedAmount<256*1024) diagnosticSend(ws,payload,"broadcast");
 }
-function send(ws,obj) {if(ws.readyState===WebSocket.OPEN) ws.send(JSON.stringify(obj));}
+const diagConnections=new WeakMap();
+let diagSerial=0;
+function netLog(event,ws,extra={}){const c=diagConnections.get(ws);console.log(JSON.stringify({event,serverMs:Date.now(),connection:c?.id,role:c?.role,station:c?.station,...extra}));}
+function diagnosticSend(ws,payload,kind){
+ const pending=ws.bufferedAmount;
+ if(pending>65536)netLog('net_backpressure',ws,{kind,pending});
+ ws.send(payload,err=>{if(err)netLog('net_send_error',ws,{kind,error:String(err.message).slice(0,180),pending:ws.bufferedAmount});});
+}
+function send(ws,obj) {if(ws.readyState===WebSocket.OPEN) diagnosticSend(ws,JSON.stringify(obj),obj.type);}
+let diagTick=Date.now();
+setInterval(()=>{const now=Date.now(),lag=now-diagTick-1000;diagTick=now;if(lag>100)console.log(JSON.stringify({event:'net_event_loop_delay',serverMs:now,lagMs:lag}));},1000).unref();
 function validBatch(m) {
   return safeId(m.station) && safeId(m.session) && [1,2,3].includes(m.tier)
     && Number.isSafeInteger(m.batch) && m.batch>=0 && m.batch<=10000000
@@ -197,18 +207,21 @@ function startWorker(){
 }
 wss.on('connection', (ws,req)=>{
   let role=null, station=null, authenticated=false;
-  ws.on('message',raw=>{
+  const dc={id:++diagSerial,opened:Date.now(),lastRx:Date.now(),messages:0,role:null,station:null};diagConnections.set(ws,dc);
+  netLog('net_open',ws);
+  ws.on('error',err=>netLog('net_socket_error',ws,{error:String(err.message).slice(0,180)}));
+  ws.on('message',raw=>{dc.lastRx=Date.now();dc.messages++;
     let m; try {m=JSON.parse(raw.toString());} catch {send(ws,{type:'error',error:'invalid_json'});return;}
     if (!authenticated) {
       if (m.type!=='hello' || !['device','dashboard'].includes(m.role)) {ws.close(1008,'auth required');return;}
       if(m.role==='device' && safeId(m.station) && tokenEq(m.token,deviceToken)) {
         authenticated=true;role='device';station=m.station;
-        const old=devices.get(station); if(old && old!==ws) old.close(1000,'replaced');
+        const old=devices.get(station); if(old && old!==ws) {netLog('net_replaced',old,{replacement:dc.id,station});old.close(1000,'replaced');}
         devices.set(station,ws);
       } else if(m.role==='dashboard' && tokenEq(m.token,dashboardToken)) {
         authenticated=true;role='dashboard';dashboards.add(ws);
       } else {ws.close(1008,'unauthorized');return;}
-      send(ws,{type:'hello_ack',serverMs:Date.now()});if(role==='dashboard')for(const status of recordingStatus.values())send(ws,{type:'recording_status',...status});return;
+      dc.role=role;dc.station=station;netLog('net_auth',ws);send(ws,{type:'hello_ack',serverMs:Date.now()});if(role==='dashboard')for(const status of recordingStatus.values())send(ws,{type:'recording_status',...status});return;
     }
     if (role==='dashboard') {
       if(m.type==='list_recordings' && safeId(m.station)){
@@ -316,6 +329,6 @@ wss.on('connection', (ws,req)=>{
       emitToDashboards({type:'diag',station,serverMs:Date.now(),data:m});
     }
   });
-  ws.on('close',()=>{if(role==='dashboard') dashboards.delete(ws);if(role==='device'&&devices.get(station)===ws)devices.delete(station);});
+  ws.on('close',(code,reason)=>{netLog('net_close',ws,{code,reason:reason.toString().slice(0,120),lifetimeMs:Date.now()-dc.opened,lastRxAgeMs:Date.now()-dc.lastRx,messages:dc.messages,pending:ws.bufferedAmount});if(role==='dashboard') dashboards.delete(ws);if(role==='device'&&devices.get(station)===ws)devices.delete(station);});
 });
 server.listen(PORT,()=>process.stdout.write(`ENP162 experimental relay ${SERVER_REVISION} listening on ${PORT}\n`));
