@@ -16,7 +16,7 @@ const db = admin.database();
 
 // v0.16: Read-only, authenticated recording discovery and bounded retrieval.
 // The existing recording/persistence pipeline is intentionally unchanged.
-const SERVER_REVISION='v0.19_SELECTIVE_RESET';
+const SERVER_REVISION='v0.20_MONITOR_ISOLATION';
 const MAX_LIST_SESSIONS=150;
 const MAX_PAGE_BATCHES=20;
 const MAX_PAGE_SAMPLES=2000;
@@ -224,7 +224,7 @@ wss.on('connection', (ws,req)=>{
       dc.role=role;dc.station=station;netLog('net_auth',ws);send(ws,{type:'hello_ack',serverMs:Date.now()});if(role==='dashboard')for(const status of recordingStatus.values())send(ws,{type:'recording_status',...status});return;
     }
     if (role==='dashboard') {
-      if(m.type==='manage' && safeId(m.station) && safeId(m.requestId) && ['snapshot','application','transport','combined','restart'].includes(m.operation)){
+      if(m.type==='manage' && safeId(m.station) && safeId(m.requestId) && ['snapshot','application','transport','combined','restart','monitor_on','monitor_off','live_on','live_off'].includes(m.operation)){
         const device=devices.get(m.station);
         if(!device || device.readyState!==WebSocket.OPEN){send(ws,{type:'management_status',station:m.station,requestId:m.requestId,phase:'offline'});return;}
         send(device,{type:'command',action:'manage',operation:m.operation,requestId:m.requestId});return;
