@@ -16,7 +16,7 @@ const db = admin.database();
 
 // v0.16: Read-only, authenticated recording discovery and bounded retrieval.
 // The existing recording/persistence pipeline is intentionally unchanged.
-const SERVER_REVISION='v0.18_TRANSPORT_DIAGNOSTICS';
+const SERVER_REVISION='v0.19_SELECTIVE_RESET';
 const MAX_LIST_SESSIONS=150;
 const MAX_PAGE_BATCHES=20;
 const MAX_PAGE_SAMPLES=2000;
@@ -224,6 +224,12 @@ wss.on('connection', (ws,req)=>{
       dc.role=role;dc.station=station;netLog('net_auth',ws);send(ws,{type:'hello_ack',serverMs:Date.now()});if(role==='dashboard')for(const status of recordingStatus.values())send(ws,{type:'recording_status',...status});return;
     }
     if (role==='dashboard') {
+      if(m.type==='manage' && safeId(m.station) && safeId(m.requestId) && ['snapshot','application','transport','combined','restart'].includes(m.operation)){
+        const device=devices.get(m.station);
+        if(!device || device.readyState!==WebSocket.OPEN){send(ws,{type:'management_status',station:m.station,requestId:m.requestId,phase:'offline'});return;}
+        send(device,{type:'command',action:'manage',operation:m.operation,requestId:m.requestId});return;
+      }
+
       if(m.type==='list_recordings' && safeId(m.station)){
         void listRecordings(m.station).then(records=>send(ws,{type:'recordings_list',station:m.station,requestId:m.requestId??null,records}))
           .catch(e=>send(ws,{type:'recordings_error',requestId:m.requestId??null,error:String(e.message||e).slice(0,180)}));return;
@@ -257,6 +263,7 @@ wss.on('connection', (ws,req)=>{
       }
       return;
     }
+    if(role==='device' && m.type==='management_status'){if(m.station===station)emitToDashboards({...m,station,serverMs:Date.now()});return;}
     if (role==='device' && m.type==='live_sample') {
       if (m.station===station && [0,1,3].includes(m.tier) && safeId(m.session) && m.sample && Number.isSafeInteger(m.sample.seq)) {
         emitToDashboards({type:'live_sample',station,session:m.session,tier:m.tier,sample:m.sample,serverReceivedMs:Date.now()});
