@@ -16,7 +16,7 @@ const db = admin.database();
 
 // v0.16: Read-only, authenticated recording discovery and bounded retrieval.
 // The existing recording/persistence pipeline is intentionally unchanged.
-const SERVER_REVISION='v0.20_MONITOR_ISOLATION';
+const SERVER_REVISION='v0.21_LIVE_FRESHNESS';
 const MAX_LIST_SESSIONS=150;
 const MAX_PAGE_BATCHES=20;
 const MAX_PAGE_SAMPLES=2000;
@@ -130,6 +130,18 @@ const tokenEq = (a,b) => {
 function emitToDashboards(obj) {
   const payload=JSON.stringify(obj);
   for (const ws of dashboards) if(ws.readyState===WebSocket.OPEN && ws.bufferedAmount<256*1024) diagnosticSend(ws,payload,"broadcast");
+}
+// Live observations are disposable; never queue behind pending dashboard writes.
+const liveWrites=new WeakSet();
+const LIVE_MAX_AGE_MS=1000;
+function freshLive(m,now){return Number.isSafeInteger(m.acquiredServerMs) && m.acquiredServerMs<=now && now-m.acquiredServerMs<LIVE_MAX_AGE_MS;}
+function emitLive(obj){
+ const payload=JSON.stringify(obj);
+ for(const ws of dashboards){
+  if(ws.readyState!==WebSocket.OPEN || ws.bufferedAmount!==0 || liveWrites.has(ws))continue;
+  liveWrites.add(ws);
+  ws.send(payload,err=>{liveWrites.delete(ws);if(err)netLog('net_send_error',ws,{kind:'live',error:String(err.message)});});
+ }
 }
 const diagConnections=new WeakMap();
 let diagSerial=0;
@@ -266,7 +278,9 @@ wss.on('connection', (ws,req)=>{
     if(role==='device' && m.type==='management_status'){if(m.station===station)emitToDashboards({...m,station,serverMs:Date.now()});return;}
     if (role==='device' && m.type==='live_sample') {
       if (m.station===station && [0,1,3].includes(m.tier) && safeId(m.session) && m.sample && Number.isSafeInteger(m.sample.seq)) {
-        emitToDashboards({type:'live_sample',station,session:m.session,tier:m.tier,sample:m.sample,serverReceivedMs:Date.now()});
+        const now=Date.now();
+        if(devices.get(station)!==ws || !freshLive(m,now))return;
+        emitLive({type:'live_sample',station,session:m.session,tier:m.tier,sample:m.sample,acquiredServerMs:m.acquiredServerMs,serverReceivedMs:now});
         evaluate(station,m.sample);
       }
       return;
@@ -274,14 +288,7 @@ wss.on('connection', (ws,req)=>{
     if (role==='device' && m.type==='batch') {
       if (!validBatch(m) || m.station!==station) {send(ws,{type:'error',error:'invalid_batch'});return;}
       const receivedMs=Date.now();
-      // Forward to live dashboard on receipt, without waiting for Firebase.
-      // Tier 1 and Tier 3 already forward individual live samples.
-      // Tier 2 forwards completed batches; no duplicate live forwarding.
-      // Detection uses the independent 10 Hz live_sample stream for every tier.
-      // Do not re-evaluate delayed Tier 2 recording batches: doing so could
-      // generate stale or duplicate alerts after the live event has passed.
-      if(m.tier===2)emitToDashboards({type:'live_batch',station,session:m.session,tier:m.tier,batch:m.batch,
-        samples:m.samples,serverReceivedMs:receivedMs,persistence:'pending'});
+      // Durable recording batches are never forwarded as current monitoring.
       const key=batchKey(m);
       if(pending.has(key)||persisted.has(key)){
         send(ws,{type:'ack',session:m.session,tier:m.tier,batch:m.batch,receivedMs,acceptedMs:Date.now(),persistence:'queued_or_persisted'});
