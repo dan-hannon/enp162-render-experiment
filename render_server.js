@@ -5,18 +5,18 @@ import admin from 'firebase-admin';
 
 const PORT = Number(process.env.PORT || 10000);
 const deviceToken = process.env.DEVICE_TOKEN;
-const dashboardToken = process.env.DASHBOARD_TOKEN;
+const instructorUIDs = new Set((process.env.INSTRUCTOR_UIDS || '').split(',').map(x=>x.trim()).filter(Boolean));
 const dbUrl = process.env.FIREBASE_DATABASE_URL;
 const sa = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
-if (!deviceToken || !dashboardToken || !dbUrl || !sa) {
-  throw new Error('Missing DEVICE_TOKEN, DASHBOARD_TOKEN, FIREBASE_DATABASE_URL, or FIREBASE_SERVICE_ACCOUNT_JSON');
+if (!deviceToken || !instructorUIDs.size || !dbUrl || !sa) {
+  throw new Error('Missing DEVICE_TOKEN, INSTRUCTOR_UIDS, FIREBASE_DATABASE_URL, or FIREBASE_SERVICE_ACCOUNT_JSON');
 }
 admin.initializeApp({credential:admin.credential.cert(JSON.parse(sa)), databaseURL:dbUrl});
 const db = admin.database();
 
 // v0.16: Read-only, authenticated recording discovery and bounded retrieval.
 // The existing recording/persistence pipeline is intentionally unchanged.
-const SERVER_REVISION='v0.21_LIVE_FRESHNESS';
+const SERVER_REVISION='v0.23_AUTHORIZATION'; // 2026-11-27_1344 ET
 const MAX_LIST_SESSIONS=150;
 const MAX_PAGE_BATCHES=20;
 const MAX_PAGE_SAMPLES=2000;
@@ -85,6 +85,23 @@ const server = http.createServer((req,res)=>{
 const wss = new WebSocketServer({server, maxPayload:128*1024, perMessageDeflate:false});
 const devices = new Map();
 const dashboards = new Set();
+const dashboardAuth = new WeakMap();
+const studentStation = s => typeof s==='string' && /^ES-(0[1-9]|[12][0-9]|3[0-2])$/.test(s);
+async function verifyDashboard(token){
+  if(typeof token!=='string')throw Error('invalid token');
+  const decoded=await admin.auth().verifyIdToken(token,true);
+  const instructor=instructorUIDs.has(decoded.uid);
+  const station=instructor?null:(await db.ref(`studentAssignments/${decoded.uid}/stationID`).once('value')).val();
+  if(!instructor&&!studentStation(station))throw Error('invalid assignment');
+  if(decoded.exp*1000<=Date.now())throw Error('expired token');
+  return {uid:decoded.uid,instructor,station,expiresMs:decoded.exp*1000};
+}
+function authorized(ws,station){
+  const a=dashboardAuth.get(ws);
+  return !!a && a.expiresMs>Date.now() && safeId(station) && (a.instructor||a.station===station);
+}
+function dashboardReply(ws,station,obj){if(authorized(ws,station))send(ws,obj);}
+
 // Per-station detector state. Configuration is persisted in experimental RTDB.
 const detectors = new Map();
 const allowedSignals = new Set(['x','y','z','sound','pir','sw','button']);
@@ -129,7 +146,7 @@ const tokenEq = (a,b) => {
 };
 function emitToDashboards(obj) {
   const payload=JSON.stringify(obj);
-  for (const ws of dashboards) if(ws.readyState===WebSocket.OPEN && ws.bufferedAmount<256*1024) diagnosticSend(ws,payload,"broadcast");
+  for (const ws of dashboards) if(authorized(ws,obj.station) && ws.readyState===WebSocket.OPEN && ws.bufferedAmount<256*1024) diagnosticSend(ws,payload,"broadcast");
 }
 // Live observations are disposable; never queue behind pending dashboard writes.
 const liveWrites=new WeakSet();
@@ -138,7 +155,7 @@ function freshLive(m,now){return Number.isSafeInteger(m.acquiredServerMs) && m.a
 function emitLive(obj){
  const payload=JSON.stringify(obj);
  for(const ws of dashboards){
-  if(ws.readyState!==WebSocket.OPEN || ws.bufferedAmount!==0 || liveWrites.has(ws))continue;
+  if(!authorized(ws,obj.station) || ws.readyState!==WebSocket.OPEN || ws.bufferedAmount!==0 || liveWrites.has(ws))continue;
   liveWrites.add(ws);
   ws.send(payload,err=>{liveWrites.delete(ws);if(err)netLog('net_send_error',ws,{kind:'live',error:String(err.message)});});
  }
@@ -218,24 +235,47 @@ function startWorker(){
   void pump();
 }
 wss.on('connection', (ws,req)=>{
-  let role=null, station=null, authenticated=false;
+  let role=null, station=null, authenticated=false, authPending=false;
   const dc={id:++diagSerial,opened:Date.now(),lastRx:Date.now(),messages:0,role:null,station:null};diagConnections.set(ws,dc);
   netLog('net_open',ws);
   ws.on('error',err=>netLog('net_socket_error',ws,{error:String(err.message).slice(0,180)}));
-  ws.on('message',raw=>{dc.lastRx=Date.now();dc.messages++;
+  ws.on('message',async raw=>{dc.lastRx=Date.now();dc.messages++;
     let m; try {m=JSON.parse(raw.toString());} catch {send(ws,{type:'error',error:'invalid_json'});return;}
+    if(!m || typeof m!=='object' || Array.isArray(m))return;
+    if(authPending&&!authenticated)return;
     if (!authenticated) {
       if (m.type!=='hello' || !['device','dashboard'].includes(m.role)) {ws.close(1008,'auth required');return;}
       if(m.role==='device' && safeId(m.station) && tokenEq(m.token,deviceToken)) {
         authenticated=true;role='device';station=m.station;
         const old=devices.get(station); if(old && old!==ws) {netLog('net_replaced',old,{replacement:dc.id,station});old.close(1000,'replaced');}
         devices.set(station,ws);
-      } else if(m.role==='dashboard' && tokenEq(m.token,dashboardToken)) {
-        authenticated=true;role='dashboard';dashboards.add(ws);
+      } else if(m.role==='dashboard') {
+        authPending=true;
+        try{
+          const a=await verifyDashboard(m.token);
+          if(ws.readyState!==WebSocket.OPEN)return;
+          dashboardAuth.set(ws,a);authenticated=true;role='dashboard';station=a.station;dashboards.add(ws);
+        }catch{netLog('net_auth_rejected',ws);ws.close(1008,'unauthorized');return;}
+        finally{authPending=false;}
       } else {ws.close(1008,'unauthorized');return;}
-      dc.role=role;dc.station=station;netLog('net_auth',ws);send(ws,{type:'hello_ack',serverMs:Date.now()});if(role==='dashboard')for(const status of recordingStatus.values())send(ws,{type:'recording_status',...status});return;
+      dc.role=role;dc.station=station;netLog('net_auth',ws);send(ws,{type:'hello_ack',serverMs:Date.now(),...(role==='dashboard'?{instructor:dashboardAuth.get(ws).instructor,station,expiresMs:dashboardAuth.get(ws).expiresMs}:{})});if(role==='dashboard')for(const status of recordingStatus.values())dashboardReply(ws,status.station,{type:'recording_status',...status});return;
     }
     if (role==='dashboard') {
+      if(m.type==='renew_auth'){
+        if(authPending)return;
+        authPending=true;
+        try{
+          const previous=dashboardAuth.get(ws), a=await verifyDashboard(m.token);
+          if(ws.readyState!==WebSocket.OPEN)return;
+          if(a.uid!==previous.uid||a.station!==previous.station||a.instructor!==previous.instructor)throw Error('authorization changed');
+          dashboardAuth.set(ws,a);netLog('net_auth_renewed',ws);send(ws,{type:'auth_renewed',expiresMs:a.expiresMs});
+        }catch{dashboardAuth.delete(ws);netLog('net_auth_rejected',ws);ws.close(1008,'renewal rejected');}
+        finally{authPending=false;}return;
+      }
+      if(!authorized(ws,m.station)){
+        if(dashboardAuth.get(ws)?.expiresMs<=Date.now()){ws.close(1008,'expired token');return;}
+        send(ws,{type:['list_recordings','get_recording_page'].includes(m.type)?'recordings_error':'error',requestId:m.requestId??null,error:'station_not_authorized'});return;
+      }
       if(m.type==='manage' && safeId(m.station) && safeId(m.requestId) && ['snapshot','application','transport','combined','restart','monitor_on','monitor_off','live_on','live_off'].includes(m.operation)){
         const device=devices.get(m.station);
         if(!device || device.readyState!==WebSocket.OPEN){send(ws,{type:'management_status',station:m.station,requestId:m.requestId,phase:'offline'});return;}
@@ -243,21 +283,21 @@ wss.on('connection', (ws,req)=>{
       }
 
       if(m.type==='list_recordings' && safeId(m.station)){
-        void listRecordings(m.station).then(records=>send(ws,{type:'recordings_list',station:m.station,requestId:m.requestId??null,records}))
-          .catch(e=>send(ws,{type:'recordings_error',requestId:m.requestId??null,error:String(e.message||e).slice(0,180)}));return;
+        void listRecordings(m.station).then(records=>dashboardReply(ws,m.station,{type:'recordings_list',station:m.station,requestId:m.requestId??null,records}))
+          .catch(e=>dashboardReply(ws,m.station,{type:'recordings_error',requestId:m.requestId??null,error:String(e.message||e).slice(0,180)}));return;
       }
       if(m.type==='get_recording_page' && safeId(m.station) && safeId(m.session) && [1,2,3].includes(m.tier)){
         const after=m.afterBatch===null||m.afterBatch===undefined?null:Number(m.afterBatch);
         void recordingPage(m.station,m.session,m.tier,after,m.limit)
-          .then(page=>send(ws,{type:'recording_page',requestId:m.requestId??null,...page}))
-          .catch(e=>send(ws,{type:'recordings_error',requestId:m.requestId??null,error:String(e.message||e).slice(0,180)}));return;
+          .then(page=>dashboardReply(ws,m.station,{type:'recording_page',requestId:m.requestId??null,...page}))
+          .catch(e=>dashboardReply(ws,m.station,{type:'recordings_error',requestId:m.requestId??null,error:String(e.message||e).slice(0,180)}));return;
       }
       if(m.type==='get_recording_status' && safeId(m.station)){send(ws,{type:'recording_status',...(recordingStatus.get(m.station)||{station:m.station,state:'unknown',queuedBatches:queueSnapshot(m.station)})});return;}
       if(m.type==='set_detector' && safeId(m.station) && validDetector(m.detector)) {
         const d=m.detector;
         db.ref(`experimentalDetectors/${m.station}`).set(d).then(()=>{
           detectors.set(m.station,{...d,wasActive:false,lastAlert:0});
-          send(ws,{type:'detector_saved',station:m.station,detector:d});
+          dashboardReply(ws,m.station,{type:'detector_saved',station:m.station,detector:d});
         }).catch(()=>send(ws,{type:'error',error:'detector_save_failed'}));
         return;
       }
