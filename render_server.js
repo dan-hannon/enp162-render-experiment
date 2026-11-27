@@ -16,7 +16,7 @@ const db = admin.database();
 
 // v0.16: Read-only, authenticated recording discovery and bounded retrieval.
 // The existing recording/persistence pipeline is intentionally unchanged.
-const SERVER_REVISION='v0.23_AUTHORIZATION'; // 2026-11-27_1344 ET
+const SERVER_REVISION='v0.23.1_AUTH_DIAGNOSTICS'; // 2026-11-27_1509 ET
 const MAX_LIST_SESSIONS=150;
 const MAX_PAGE_BATCHES=20;
 const MAX_PAGE_SAMPLES=2000;
@@ -87,10 +87,34 @@ const devices = new Map();
 const dashboards = new Set();
 const dashboardAuth = new WeakMap();
 const studentStation = s => typeof s==='string' && /^ES-(0[1-9]|[12][0-9]|3[0-2])$/.test(s);
-async function verifyDashboard(token){
+// Authentication diagnostics: never emit raw exception text or credentials.
+function authFailure(ws,phase,e){
+  const rawCode=e?.code;
+  const code=typeof rawCode==='string' && /^(auth|app|database)\/[a-z-]+$/.test(rawCode)?rawCode:'unclassified';
+  const messages={
+    'auth/insufficient-permission':'Firebase Authentication permission denied',
+    'auth/invalid-credential':'Firebase credential rejected',
+    'auth/argument-error':'Firebase token argument or claims rejected',
+    'auth/invalid-id-token':'Firebase identity token invalid',
+    'auth/id-token-expired':'Firebase identity token expired',
+    'auth/id-token-revoked':'Firebase identity token revoked',
+    'auth/user-not-found':'Firebase user not found',
+    'auth/user-disabled':'Firebase user disabled',
+    'auth/internal-error':'Firebase Authentication internal error',
+    'app/invalid-credential':'Firebase application credential invalid',
+    'app/network-error':'Firebase application network error'
+  };
+  const local=['invalid token','invalid assignment','expired token','authorization changed'];
+  const message=messages[code] || (local.includes(e?.message)?e.message:'Unclassified authentication exception; raw message withheld');
+  netLog('net_auth_rejected',ws,{phase,errorCode:code,errorMessage:message});
+}
+async function verifyDashboard(token,ws,phase){
+  netLog('net_auth_verify_begin',ws,{phase});
   if(typeof token!=='string')throw Error('invalid token');
   const decoded=await admin.auth().verifyIdToken(token,true);
+  netLog('net_auth_verify_ok',ws,{phase});
   const instructor=instructorUIDs.has(decoded.uid);
+  netLog('net_auth_instructor',ws,{phase,instructor});
   const station=instructor?null:(await db.ref(`studentAssignments/${decoded.uid}/stationID`).once('value')).val();
   if(!instructor&&!studentStation(station))throw Error('invalid assignment');
   if(decoded.exp*1000<=Date.now())throw Error('expired token');
@@ -252,10 +276,10 @@ wss.on('connection', (ws,req)=>{
       } else if(m.role==='dashboard') {
         authPending=true;
         try{
-          const a=await verifyDashboard(m.token);
+          const a=await verifyDashboard(m.token,ws,'initial');
           if(ws.readyState!==WebSocket.OPEN)return;
           dashboardAuth.set(ws,a);authenticated=true;role='dashboard';station=a.station;dashboards.add(ws);
-        }catch{netLog('net_auth_rejected',ws);ws.close(1008,'unauthorized');return;}
+        }catch(e){authFailure(ws,'initial',e);ws.close(1008,'unauthorized');return;}
         finally{authPending=false;}
       } else {ws.close(1008,'unauthorized');return;}
       dc.role=role;dc.station=station;netLog('net_auth',ws);send(ws,{type:'hello_ack',serverMs:Date.now(),...(role==='dashboard'?{instructor:dashboardAuth.get(ws).instructor,station,expiresMs:dashboardAuth.get(ws).expiresMs}:{})});if(role==='dashboard')for(const status of recordingStatus.values())dashboardReply(ws,status.station,{type:'recording_status',...status});return;
@@ -265,11 +289,11 @@ wss.on('connection', (ws,req)=>{
         if(authPending)return;
         authPending=true;
         try{
-          const previous=dashboardAuth.get(ws), a=await verifyDashboard(m.token);
+          const previous=dashboardAuth.get(ws), a=await verifyDashboard(m.token,ws,'renewal');
           if(ws.readyState!==WebSocket.OPEN)return;
           if(a.uid!==previous.uid||a.station!==previous.station||a.instructor!==previous.instructor)throw Error('authorization changed');
           dashboardAuth.set(ws,a);netLog('net_auth_renewed',ws);send(ws,{type:'auth_renewed',expiresMs:a.expiresMs});
-        }catch{dashboardAuth.delete(ws);netLog('net_auth_rejected',ws);ws.close(1008,'renewal rejected');}
+        }catch(e){dashboardAuth.delete(ws);authFailure(ws,'renewal',e);ws.close(1008,'renewal rejected');}
         finally{authPending=false;}return;
       }
       if(!authorized(ws,m.station)){
