@@ -19,7 +19,7 @@ const authDb = admin.database(authApp);
 
 // v0.16: Read-only, authenticated recording discovery and bounded retrieval.
 // The existing recording/persistence pipeline is intentionally unchanged.
-const SERVER_REVISION='v0.23.2_DUAL_FIREBASE'; // 2026-11-27_1528 ET
+const SERVER_REVISION='v0.24_CLOCK_SYNC'; // 2026-11-27_1645 ET
 const MAX_LIST_SESSIONS=150;
 const MAX_PAGE_BATCHES=20;
 const MAX_PAGE_SAMPLES=2000;
@@ -288,6 +288,12 @@ wss.on('connection', (ws,req)=>{
       dc.role=role;dc.station=station;netLog('net_auth',ws);send(ws,{type:'hello_ack',serverMs:Date.now(),...(role==='dashboard'?{instructor:dashboardAuth.get(ws).instructor,station,expiresMs:dashboardAuth.get(ws).expiresMs}:{})});if(role==='dashboard')for(const status of recordingStatus.values())dashboardReply(ws,status.station,{type:'recording_status',...status});return;
     }
     if (role==='dashboard') {
+      if(m.type==='clock_sync'){
+        const a=dashboardAuth.get(ws);
+        if(!a||a.expiresMs<=Date.now()){ws.close(1008,'expired token');return;}
+        if(Number.isSafeInteger(m.requestId)&&m.requestId>0)send(ws,{type:'clock_sync_ack',requestId:m.requestId,serverMs:Date.now()});
+        return;
+      }
       if(m.type==='renew_auth'){
         if(authPending)return;
         authPending=true;
