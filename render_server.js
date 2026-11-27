@@ -8,15 +8,18 @@ const deviceToken = process.env.DEVICE_TOKEN;
 const instructorUIDs = new Set((process.env.INSTRUCTOR_UIDS || '').split(',').map(x=>x.trim()).filter(Boolean));
 const dbUrl = process.env.FIREBASE_DATABASE_URL;
 const sa = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
-if (!deviceToken || !instructorUIDs.size || !dbUrl || !sa) {
-  throw new Error('Missing DEVICE_TOKEN, INSTRUCTOR_UIDS, FIREBASE_DATABASE_URL, or FIREBASE_SERVICE_ACCOUNT_JSON');
+const authSa = process.env.FIREBASE_AUTH_SERVICE_ACCOUNT_JSON;
+if (!deviceToken || !instructorUIDs.size || !dbUrl || !sa || !authSa) {
+  throw new Error('Missing DEVICE_TOKEN, INSTRUCTOR_UIDS, FIREBASE_DATABASE_URL, FIREBASE_SERVICE_ACCOUNT_JSON, or FIREBASE_AUTH_SERVICE_ACCOUNT_JSON');
 }
 admin.initializeApp({credential:admin.credential.cert(JSON.parse(sa)), databaseURL:dbUrl});
 const db = admin.database();
+const authApp = admin.initializeApp({credential:admin.credential.cert(JSON.parse(authSa)), projectId:'iot-fall-2026', databaseURL:'https://iot-fall-2026-default-rtdb.firebaseio.com'}, 'student-auth');
+const authDb = admin.database(authApp);
 
 // v0.16: Read-only, authenticated recording discovery and bounded retrieval.
 // The existing recording/persistence pipeline is intentionally unchanged.
-const SERVER_REVISION='v0.23.1_AUTH_DIAGNOSTICS'; // 2026-11-27_1509 ET
+const SERVER_REVISION='v0.23.2_DUAL_FIREBASE'; // 2026-11-27_1528 ET
 const MAX_LIST_SESSIONS=150;
 const MAX_PAGE_BATCHES=20;
 const MAX_PAGE_SAMPLES=2000;
@@ -111,11 +114,11 @@ function authFailure(ws,phase,e){
 async function verifyDashboard(token,ws,phase){
   netLog('net_auth_verify_begin',ws,{phase});
   if(typeof token!=='string')throw Error('invalid token');
-  const decoded=await admin.auth().verifyIdToken(token,true);
+  const decoded=await admin.auth(authApp).verifyIdToken(token,true);
   netLog('net_auth_verify_ok',ws,{phase});
   const instructor=instructorUIDs.has(decoded.uid);
   netLog('net_auth_instructor',ws,{phase,instructor});
-  const station=instructor?null:(await db.ref(`studentAssignments/${decoded.uid}/stationID`).once('value')).val();
+  const station=instructor?null:(await authDb.ref(`studentAssignments/${decoded.uid}/stationID`).once('value')).val();
   if(!instructor&&!studentStation(station))throw Error('invalid assignment');
   if(decoded.exp*1000<=Date.now())throw Error('expired token');
   return {uid:decoded.uid,instructor,station,expiresMs:decoded.exp*1000};
