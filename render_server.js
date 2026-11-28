@@ -19,7 +19,7 @@ const authDb = admin.database(authApp);
 
 // v0.16: Read-only, authenticated recording discovery and bounded retrieval.
 // The existing recording/persistence pipeline is intentionally unchanged.
-const SERVER_REVISION='v0.25_DELETE'; // 2026-11-27_1928 ET
+const SERVER_REVISION='v0.25.1_DELETE'; // 2026-11-27_1939 ET
 const MAX_LIST_SESSIONS=150;
 const MAX_PAGE_BATCHES=20;
 const MAX_PAGE_SAMPLES=2000;
@@ -235,8 +235,7 @@ async function deleteRecordings(ws,m){
     if(!authorized(ws,st))throw Error('authorization expired');
     const key=deletionKey(st,r.session,r.tier),root=recordingRoot(st,r.session,r.tier);
     if(deletionKeys.has(key)){if((await db.ref(`experimentalDeletions/${key}`).once('value')).exists()){results.push({...r,ok:true});continue;}throw Error('Previous deletion not confirmed; instructor review required');}
-    const meta=(await db.ref(`${root}/completion`).once('value')).val();
-    if(!meta?.completed && !(a.instructor&&m.historical===true))throw Error('Historical recording requires instructor approval');
+    // Historical recordings use the same confirmed-idle and persistence guards.
     if(!(await db.ref(`${root}/batches/b00000000`).once('value')).exists())throw Error('Recording not found');
     if(!authorized(ws,st)||idleProof.get(st)!==devices.get(st)||queueSnapshot(st)||completionWrites.get(st)||deferredCompletion.has(st))throw Error('Station no longer safe');
     // Reserve tombstone before awaiting atomic update; late messages cannot race it.
