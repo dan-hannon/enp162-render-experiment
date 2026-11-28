@@ -19,7 +19,7 @@ const authDb = admin.database(authApp);
 
 // v0.16: Read-only, authenticated recording discovery and bounded retrieval.
 // The existing recording/persistence pipeline is intentionally unchanged.
-const SERVER_REVISION='v0.28.1_ASSOCIATIONS'; // 2026-11-27_2145 ET
+const SERVER_REVISION='v0.28.2_ASSOCIATED_RECORDINGS'; // 2026-11-27_2202 ET
 const MAX_LIST_SESSIONS=150;
 const MAX_PAGE_BATCHES=20;
 const MAX_PAGE_SAMPLES=2000;
@@ -127,6 +127,20 @@ function authorized(ws,station){
   const a=dashboardAuth.get(ws);
   return !!a && a.expiresMs>Date.now() && safeId(station) && (a.instructor||a.station===station);
 }
+// Read-only experiment association summary; never reads full recordings.
+async function associatedRecordings(station,records){
+  const annotations=(await db.ref(`experimentalRecordingAnnotations/${station}`).once('value')).val()||{};
+  const byId=new Map(records.map(r=>[r.id,[]]));
+  for(const r of records)r.associatedRecordings=byId.get(r.id);
+  if(!Object.values(annotations).some(tiers=>Object.values(tiers||{}).some(a=>byId.has(a?.experimentId))))return;
+  const library=await listRecordings(station);
+  for(const r of library){
+    const a=annotations[r.session]?.[`tier${r.tier}`];
+    if(byId.has(a?.experimentId))byId.get(a.experimentId).push({name:a.name||'',tier:r.tier,session:r.session,recordedMs:r.recordedMs});
+  }
+  for(const r of records)r.associatedRecordings=byId.get(r.id);
+}
+
 const experimentWrites=new Map();
 async function serializeExperiment(station,work){
   const previous=experimentWrites.get(station)||Promise.resolve();
@@ -434,6 +448,7 @@ wss.on('connection', (ws,req)=>{
           }else{
             const snap=await ref.once('value');const records=[];
             snap.forEach(child=>{const v=child.val();records.push({id:child.key,name:v.name,question:v.question,description:v.description,createdMs:v.createdMs});});
+            try{await associatedRecordings(m.station,records);}catch(e){for(const r of records)delete r.associatedRecordings;console.error('experiment_associations_read_failed',String(e));}
             reply({type:'experiment_list_result',records});
           }
         }catch(e){reply({type:'experiment_error',error:'Experiment request failed: '+String(e.message||e).slice(0,160)});}
