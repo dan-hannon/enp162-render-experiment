@@ -19,7 +19,7 @@ const authDb = admin.database(authApp);
 
 // v0.16: Read-only, authenticated recording discovery and bounded retrieval.
 // The existing recording/persistence pipeline is intentionally unchanged.
-const SERVER_REVISION='v0.28.3_LIBRARY_NAMES'; // 2026-11-27_2209 ET
+const SERVER_REVISION='v0.28.5_METADATA_CLEANUP'; // 2026-11-27_2218 ET
 const MAX_LIST_SESSIONS=150;
 const MAX_PAGE_BATCHES=20;
 const MAX_PAGE_SAMPLES=2000;
@@ -155,6 +155,14 @@ async function serializeExperiment(station,work){
   experimentWrites.set(station,task);
   try{return await task;}finally{if(experimentWrites.get(station)===task)experimentWrites.delete(station);}
 }
+function experimentDeletionUpdates(station,id,annotations){
+ const updates={[`experimentalExperiments/${station}/${id}`]:null};
+ for(const [session,tiers] of Object.entries(annotations)){
+  if(!safeId(session))continue;
+  for(const tier of ['tier1','tier2','tier3'])if(tiers?.[tier]?.experimentId===id)updates[`experimentalRecordingAnnotations/${station}/${session}/${tier}/experimentId`]='';
+ }
+ return updates;
+}
 function validateExperiment(m){
   const fields={};
   for(const [key,max] of [['name',200],['question',2000],['description',4000]]){
@@ -260,6 +268,9 @@ function deletionSafe(st){const d=devices.get(st), proof=idleProof.get(st);retur
 function deletionStatus(st){emitToDashboards({type:'deletion_status',station:st,safe:deletionSafe(st)});}
 function invalidateIdle(st){idleProof.delete(st);idleRequests.delete(st);deletionStatus(st);}
 async function deleteRecordings(ws,m){
+ return serializeExperiment(m.station,()=>deleteRecordingsLocked(ws,m));
+}
+async function deleteRecordingsLocked(ws,m){
  const st=m.station, a=dashboardAuth.get(ws);
  if(!authorized(ws,st)||!Array.isArray(m.records)||!m.records.length||m.records.length>20||!m.records.every(r=>r&&safeId(r.session)&&[1,2,3].includes(r.tier)))throw Error('invalid deletion request');
  if(!deletionSafe(st))throw Error('Station must be confirmed idle with no pending writes; request a management snapshot');
@@ -271,13 +282,13 @@ async function deleteRecordings(ws,m){
    try{
     if(!authorized(ws,st))throw Error('authorization expired');
     const key=deletionKey(st,r.session,r.tier),root=recordingRoot(st,r.session,r.tier);
-    if(deletionKeys.has(key)){if((await db.ref(`experimentalDeletions/${key}`).once('value')).exists()){results.push({...r,ok:true});continue;}throw Error('Previous deletion not confirmed; instructor review required');}
+    if(deletionKeys.has(key)){if((await db.ref(`experimentalDeletions/${key}`).once('value')).exists()){await db.ref(`experimentalRecordingAnnotations/${key}`).remove();results.push({...r,ok:true});continue;}throw Error('Previous deletion not confirmed; instructor review required');}
     // Historical recordings use the same confirmed-idle and persistence guards.
     if(!(await db.ref(`${root}/batches/b00000000`).once('value')).exists())throw Error('Recording not found');
     if(!authorized(ws,st)||idleProof.get(st)!==devices.get(st)||queueSnapshot(st)||completionWrites.get(st)||deferredCompletion.has(st))throw Error('Station no longer safe');
     // Reserve tombstone before awaiting atomic update; late messages cannot race it.
     deletionKeys.add(key);
-    try{await db.ref().update({[root]:null,[`experimentalDeletions/${key}`]:{uid:a.uid,deletedMs:Date.now()}});}
+    try{await db.ref().update({[root]:null,[`experimentalRecordingAnnotations/${key}`]:null,[`experimentalDeletions/${key}`]:{uid:a.uid,deletedMs:Date.now()}});}
     catch(e){ // Keep protection in memory on ambiguous commit; require inventory refresh.
       throw Error('Deletion not confirmed; refresh inventory');
     }
@@ -406,6 +417,7 @@ wss.on('connection', (ws,req)=>{
           const ref=db.ref(`experimentalRecordingAnnotations/${key}`);
           if(!(await db.ref(`${recordingRoot(m.station,m.session,m.tier)}/batches/b00000000`).once('value')).exists())throw Error('Recording not found');
           if(m.type==='annotation_save'){
+            await serializeExperiment(m.station,async()=>{
             if(typeof m.name!=='string'||m.name.length>200||typeof m.notes!=='string'||m.notes.length>4000)throw Error('Invalid annotation fields');
             if(!authorized(ws,m.station)||deleting.has(m.station)||deletionKeys.has(key))throw Error('Recording unavailable');
             const experimentId=m.experimentId??'';
@@ -417,6 +429,7 @@ wss.on('connection', (ws,req)=>{
             const confirmed=(await ref.once('value')).val();
             if(!confirmed||confirmed.name!==value.name||confirmed.notes!==value.notes||confirmed.experimentId!==value.experimentId)throw Error('Annotation save not confirmed');
             reply({type:'annotation_result',annotation:confirmed});
+            });
           }else{
             const value=(await ref.once('value')).val();
             reply({type:'annotation_result',annotation:value||{name:'',notes:''}});
@@ -444,7 +457,12 @@ wss.on('connection', (ws,req)=>{
               const existing=await child.once('value');
               if(!existing.exists())throw Error('Experiment not found before modification');
               if(!authorized(ws,m.station))throw Error('station_not_authorized');
-              if(editing)await child.update(fields);else await child.remove();
+              if(editing)await child.update(fields);else {
+                const annotations=(await db.ref(`experimentalRecordingAnnotations/${m.station}`).once('value')).val()||{};
+                const updates=experimentDeletionUpdates(m.station,m.id,annotations);
+                if(!authorized(ws,m.station))throw Error('station_not_authorized');
+                await db.ref().update(updates);
+              }
               const confirmed=await child.once('value');
               if(editing){
                 const value=confirmed.val();
