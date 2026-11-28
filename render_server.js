@@ -19,7 +19,7 @@ const authDb = admin.database(authApp);
 
 // v0.16: Read-only, authenticated recording discovery and bounded retrieval.
 // The existing recording/persistence pipeline is intentionally unchanged.
-const SERVER_REVISION='v0.27.1_EXPERIMENTS'; // 2026-11-27_2057 ET
+const SERVER_REVISION='v0.27.3_EXPERIMENTS'; // 2026-11-27_2115 ET
 const MAX_LIST_SESSIONS=150;
 const MAX_PAGE_BATCHES=20;
 const MAX_PAGE_SAMPLES=2000;
@@ -126,6 +126,13 @@ async function verifyDashboard(token,ws,phase){
 function authorized(ws,station){
   const a=dashboardAuth.get(ws);
   return !!a && a.expiresMs>Date.now() && safeId(station) && (a.instructor||a.station===station);
+}
+const experimentWrites=new Map();
+async function serializeExperiment(station,work){
+  const previous=experimentWrites.get(station)||Promise.resolve();
+  const task=previous.catch(()=>{}).then(work);
+  experimentWrites.set(station,task);
+  try{return await task;}finally{if(experimentWrites.get(station)===task)experimentWrites.delete(station);}
 }
 function validateExperiment(m){
   const fields={};
@@ -374,20 +381,29 @@ wss.on('connection', (ws,req)=>{
         if(!authorized(ws,m.station)){send(ws,{type:'experiment_error',requestId:m.requestId,station:m.station,error:'station_not_authorized'});return;}
         try{
           const ref=db.ref(`experimentalExperiments/${m.station}`);
-          if(m.type==='experiment_create'){
-            const fields=validateExperiment(m);
-            const record={...fields,createdMs:Date.now(),createdBy:dashboardAuth.get(ws).uid};
-            const child=ref.push();await child.set(record);
-            reply({type:'experiment_created',id:child.key});
-          }else if(m.type==='experiment_edit'||m.type==='experiment_delete'){
-            if(typeof m.id!=='string'||!/^[-A-Za-z0-9_]{1,128}$/.test(m.id))throw Error('Invalid experiment ID');
-            const editing=m.type==='experiment_edit',fields=editing?validateExperiment(m):null;
-            const result=await ref.child(m.id).transaction(current=>{
-              if(!current||typeof current!=='object')return;
-              return editing?{...current,...fields}:null;
+          if(m.type!=='experiment_list'){
+            await serializeExperiment(m.station,async()=>{
+              if(!authorized(ws,m.station))throw Error('station_not_authorized');
+              if(m.type==='experiment_create'){
+                const fields=validateExperiment(m);
+                const record={...fields,createdMs:Date.now(),createdBy:dashboardAuth.get(ws).uid};
+                const child=ref.push();await child.set(record);
+                reply({type:'experiment_created',id:child.key});return;
+              }
+              if(typeof m.id!=='string'||!/^[-A-Za-z0-9_]{1,128}$/.test(m.id))throw Error('Invalid experiment ID');
+              const editing=m.type==='experiment_edit',fields=editing?validateExperiment(m):null;
+              const child=ref.child(m.id);
+              const existing=await child.once('value');
+              if(!existing.exists())throw Error('Experiment not found before modification');
+              if(!authorized(ws,m.station))throw Error('station_not_authorized');
+              if(editing)await child.update(fields);else await child.remove();
+              const confirmed=await child.once('value');
+              if(editing){
+                const value=confirmed.val();
+                if(!confirmed.exists()||!value||Object.entries(fields).some(([k,v])=>value[k]!==v))throw Error('Experiment edit not confirmed by readback');
+              }else if(confirmed.exists())throw Error('Experiment deletion not confirmed by readback');
+              reply({type:editing?'experiment_edited':'experiment_deleted',id:m.id});
             });
-            if(!result.committed)throw Error('Experiment no longer exists');
-            reply({type:editing?'experiment_edited':'experiment_deleted',id:m.id});
           }else{
             const snap=await ref.once('value');const records=[];
             snap.forEach(child=>{const v=child.val();records.push({id:child.key,name:v.name,question:v.question,description:v.description,createdMs:v.createdMs});});
