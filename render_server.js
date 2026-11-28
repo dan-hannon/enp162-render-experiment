@@ -19,7 +19,7 @@ const authDb = admin.database(authApp);
 
 // v0.16: Read-only, authenticated recording discovery and bounded retrieval.
 // The existing recording/persistence pipeline is intentionally unchanged.
-const SERVER_REVISION='v0.28.7_EXPORT_ELIGIBILITY'; // 2026-11-27_2237 ET
+const SERVER_REVISION='v0.29.7'; // 2026-11-28_0821 ET
 const MAX_LIST_SESSIONS=150;
 const MAX_PAGE_BATCHES=20;
 const MAX_PAGE_SAMPLES=2000;
@@ -155,6 +155,52 @@ async function serializeExperiment(station,work){
   experimentWrites.set(station,task);
   try{return await task;}finally{if(experimentWrites.get(station)===task)experimentWrites.delete(station);}
 }
+// Analytical metadata storage and retrieval.
+function analyticalValue(value,total){
+ const i=value?.interval, markers=value?.markers;
+ const time=t=>typeof t==='number'&&Number.isFinite(t)&&t>=0&&t<=total;
+ if(!i||typeof i.full!=='boolean'||!time(i.start)||!time(i.end)||i.start>i.end||(i.full&&(i.start!==0||i.end!==total)))throw Error('Invalid analysis interval');
+ if(!Array.isArray(markers))throw Error('Invalid markers');
+ const ids=new Set();
+ const clean=markers.map(m=>{
+  if(!m||!Number.isSafeInteger(m.id)||m.id<1||ids.has(m.id)||!time(m.time)||typeof m.description!=='string'||!m.description.trim())throw Error('Invalid marker');
+  ids.add(m.id);return {id:m.id,time:m.time,description:m.description.trim()};
+ });
+ return {interval:{start:i.start,end:i.end,full:i.full},markers:clean};
+}
+async function analyticalBounds(st,session,tier){
+ const root=recordingRoot(st,session,tier);
+ const [first,last]=await Promise.all([db.ref(`${root}/batches`).orderByKey().limitToFirst(1).once('value'),db.ref(`${root}/batches`).orderByKey().limitToLast(1).once('value')]);
+ const times=s=>Object.values(s.val()||{}).flatMap(b=>b.samples||[]).map(x=>x.ms).filter(x=>x!==null&&x!==undefined&&x!==''&&Number.isFinite(Number(x))).map(Number);
+ const a=times(first),z=times(last);
+ if(!a.length||!z.length)throw Error('Recording missing or has no valid boundary timestamps');
+ return Math.max(0,z.at(-1)-a[0]);
+}
+async function analyticalRequest(ws,m){
+ const st=m.station;
+ if(!authorized(ws,st)||!safeId(st)||!safeId(m.session)||![1,2,3].includes(m.tier))throw Error('Invalid or unauthorized recording');
+ return serializeExperiment(st,async()=>{
+  const key=deletionKey(st,m.session,m.tier);
+  await deletionReady;
+  const check=()=>{if(!authorized(ws,st)||deleting.has(st)||deletionKeys.has(key))throw Error('Recording unavailable');};
+  check();
+  const total=await analyticalBounds(st,m.session,m.tier);
+  check();
+  const ref=db.ref(`experimentalRecordingAnalysis/${key}`);
+  if(m.type==='analysis_get'){
+   const saved=(await ref.once('value')).val();check();
+   return saved?analyticalValue({...saved,markers:saved.markers??[]},total):null;
+  }
+  const value=analyticalValue(m.analysis,total);
+  check();await ref.set(value);
+  const saved=(await ref.once('value')).val();
+  if(!saved)throw Error('Analysis save not confirmed');
+  const confirmed=analyticalValue({...saved,markers:saved.markers??[]},total);
+  if(JSON.stringify(confirmed)!==JSON.stringify(value))throw Error('Analysis save not confirmed');
+  return confirmed;
+ });
+}
+
 function experimentDeletionUpdates(station,id,annotations){
  const updates={[`experimentalExperiments/${station}/${id}`]:null};
  for(const [session,tiers] of Object.entries(annotations)){
@@ -296,13 +342,13 @@ async function deleteRecordingsLocked(ws,m){
    try{
     if(!authorized(ws,st))throw Error('authorization expired');
     const key=deletionKey(st,r.session,r.tier),root=recordingRoot(st,r.session,r.tier);
-    if(deletionKeys.has(key)){if((await db.ref(`experimentalDeletions/${key}`).once('value')).exists()){await db.ref(`experimentalRecordingAnnotations/${key}`).remove();results.push({...r,ok:true});continue;}throw Error('Previous deletion not confirmed; instructor review required');}
+    if(deletionKeys.has(key)){if((await db.ref(`experimentalDeletions/${key}`).once('value')).exists()){await db.ref().update({[`experimentalRecordingAnnotations/${key}`]:null,[`experimentalRecordingAnalysis/${key}`]:null});results.push({...r,ok:true});continue;}throw Error('Previous deletion not confirmed; instructor review required');}
     // Historical recordings use the same confirmed-idle and persistence guards.
     if(!(await db.ref(`${root}/batches/b00000000`).once('value')).exists())throw Error('Recording not found');
     if(!authorized(ws,st)||idleProof.get(st)!==devices.get(st)||queueSnapshot(st)||completionWrites.get(st)||deferredCompletion.has(st))throw Error('Station no longer safe');
     // Reserve tombstone before awaiting atomic update; late messages cannot race it.
     deletionKeys.add(key);
-    try{await db.ref().update({[root]:null,[`experimentalRecordingAnnotations/${key}`]:null,[`experimentalDeletions/${key}`]:{uid:a.uid,deletedMs:Date.now()}});}
+    try{await db.ref().update({[root]:null,[`experimentalRecordingAnnotations/${key}`]:null,[`experimentalRecordingAnalysis/${key}`]:null,[`experimentalDeletions/${key}`]:{uid:a.uid,deletedMs:Date.now()}});}
     catch(e){ // Keep protection in memory on ambiguous commit; require inventory refresh.
       throw Error('Deletion not confirmed; refresh inventory');
     }
@@ -421,6 +467,11 @@ wss.on('connection', (ws,req)=>{
           dashboardAuth.set(ws,a);netLog('net_auth_renewed',ws);send(ws,{type:'auth_renewed',expiresMs:a.expiresMs});
         }catch(e){dashboardAuth.delete(ws);authFailure(ws,'renewal',e);ws.close(1008,'renewal rejected');}
         finally{authPending=false;}return;
+      }
+      if(['analysis_get','analysis_save'].includes(m.type)){
+        const reply=obj=>dashboardReply(ws,m.station,{...obj,station:m.station,session:m.session,tier:m.tier,requestId:m.requestId});
+        if(!authorized(ws,m.station)){send(ws,{type:'analysis_error',requestId:m.requestId,error:'station_not_authorized'});return;}
+        try{reply({type:'analysis_result',analysis:await analyticalRequest(ws,m)});}catch(e){reply({type:'analysis_error',error:String(e.message||e).slice(0,160)});}return;
       }
       if(['annotation_get','annotation_save'].includes(m.type)){
         const reply=obj=>dashboardReply(ws,m.station,{...obj,station:m.station,session:m.session,tier:m.tier,requestId:m.requestId});
