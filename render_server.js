@@ -19,7 +19,7 @@ const authDb = admin.database(authApp);
 
 // v0.16: Read-only, authenticated recording discovery and bounded retrieval.
 // The existing recording/persistence pipeline is intentionally unchanged.
-const SERVER_REVISION='v0.25.1_DELETE'; // 2026-11-27_1939 ET
+const SERVER_REVISION='v0.27_EXPERIMENTS'; // 2026-11-27_2044 ET
 const MAX_LIST_SESSIONS=150;
 const MAX_PAGE_BATCHES=20;
 const MAX_PAGE_SAMPLES=2000;
@@ -126,6 +126,15 @@ async function verifyDashboard(token,ws,phase){
 function authorized(ws,station){
   const a=dashboardAuth.get(ws);
   return !!a && a.expiresMs>Date.now() && safeId(station) && (a.instructor||a.station===station);
+}
+function validateExperiment(m){
+  const fields={};
+  for(const [key,max] of [['name',200],['question',2000],['description',4000]]){
+    if(typeof m[key]!=='string'||m[key].length>max)throw Error('Invalid '+key);
+    fields[key]=m[key].trim();
+  }
+  if(!fields.name)throw Error('Experiment name is required');
+  return fields;
 }
 function dashboardReply(ws,station,obj){if(authorized(ws,station))send(ws,obj);}
 
@@ -359,6 +368,24 @@ wss.on('connection', (ws,req)=>{
           dashboardAuth.set(ws,a);netLog('net_auth_renewed',ws);send(ws,{type:'auth_renewed',expiresMs:a.expiresMs});
         }catch(e){dashboardAuth.delete(ws);authFailure(ws,'renewal',e);ws.close(1008,'renewal rejected');}
         finally{authPending=false;}return;
+      }
+      if(m.type==='experiment_create'||m.type==='experiment_list'){
+        const reply=(obj)=>dashboardReply(ws,m.station,{...obj,station:m.station,requestId:m.requestId});
+        if(!authorized(ws,m.station)){send(ws,{type:'experiment_error',requestId:m.requestId,station:m.station,error:'station_not_authorized'});return;}
+        try{
+          const ref=db.ref(`experimentalExperiments/${m.station}`);
+          if(m.type==='experiment_create'){
+            const fields=validateExperiment(m);
+            const record={...fields,createdMs:Date.now(),createdBy:dashboardAuth.get(ws).uid};
+            const child=ref.push();await child.set(record);
+            reply({type:'experiment_created',id:child.key});
+          }else{
+            const snap=await ref.once('value');const records=[];
+            snap.forEach(child=>{const v=child.val();records.push({id:child.key,name:v.name,question:v.question,description:v.description,createdMs:v.createdMs});});
+            reply({type:'experiment_list_result',records});
+          }
+        }catch(e){reply({type:'experiment_error',error:'Experiment request failed: '+String(e.message||e).slice(0,160)});}
+        return;
       }
       if(!authorized(ws,m.station)){
         if(dashboardAuth.get(ws)?.expiresMs<=Date.now()){ws.close(1008,'expired token');return;}
