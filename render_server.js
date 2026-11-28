@@ -19,7 +19,7 @@ const authDb = admin.database(authApp);
 
 // v0.16: Read-only, authenticated recording discovery and bounded retrieval.
 // The existing recording/persistence pipeline is intentionally unchanged.
-const SERVER_REVISION='v0.28.5_METADATA_CLEANUP'; // 2026-11-27_2218 ET
+const SERVER_REVISION='v0.28.6_EXPERIMENT_EXPORT'; // 2026-11-27_2228 ET
 const MAX_LIST_SESSIONS=150;
 const MAX_PAGE_BATCHES=20;
 const MAX_PAGE_SAMPLES=2000;
@@ -132,13 +132,13 @@ async function associatedRecordings(station,records){
   const annotations=(await db.ref(`experimentalRecordingAnnotations/${station}`).once('value')).val()||{};
   const byId=new Map(records.map(r=>[r.id,[]]));
   for(const r of records)r.associatedRecordings=byId.get(r.id);
-  if(!Object.values(annotations).some(tiers=>Object.values(tiers||{}).some(a=>byId.has(a?.experimentId))))return;
+  if(!Object.values(annotations).some(tiers=>Object.values(tiers||{}).some(a=>byId.has(a?.experimentId)))){for(const r of records)r.exportComplete=true;return;}
   const library=await listRecordings(station);
   for(const r of library){
     const a=annotations[r.session]?.[`tier${r.tier}`];
-    if(byId.has(a?.experimentId))byId.get(a.experimentId).push({name:a.name||'',tier:r.tier,session:r.session,recordedMs:r.recordedMs});
+    if(byId.has(a?.experimentId))byId.get(a.experimentId).push({name:a.name||'',notes:a.notes||'',tier:r.tier,session:r.session,recordedMs:r.recordedMs,completed:r.completed});
   }
-  for(const r of records)r.associatedRecordings=byId.get(r.id);
+  for(const r of records){r.associatedRecordings=byId.get(r.id);const expected=Object.values(annotations).flatMap(t=>Object.values(t||{})).filter(a=>a?.experimentId===r.id).length;r.exportComplete=expected===r.associatedRecordings.length;}
 }
 
 // Read-only library enrichment; recording discovery and storage are unchanged.
