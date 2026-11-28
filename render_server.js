@@ -19,7 +19,7 @@ const authDb = admin.database(authApp);
 
 // v0.16: Read-only, authenticated recording discovery and bounded retrieval.
 // The existing recording/persistence pipeline is intentionally unchanged.
-const SERVER_REVISION='v0.28.2_ASSOCIATED_RECORDINGS'; // 2026-11-27_2202 ET
+const SERVER_REVISION='v0.28.3_LIBRARY_NAMES'; // 2026-11-27_2209 ET
 const MAX_LIST_SESSIONS=150;
 const MAX_PAGE_BATCHES=20;
 const MAX_PAGE_SAMPLES=2000;
@@ -139,6 +139,13 @@ async function associatedRecordings(station,records){
     if(byId.has(a?.experimentId))byId.get(a.experimentId).push({name:a.name||'',tier:r.tier,session:r.session,recordedMs:r.recordedMs});
   }
   for(const r of records)r.associatedRecordings=byId.get(r.id);
+}
+
+// Read-only library enrichment; recording discovery and storage are unchanged.
+async function libraryNames(station,records){
+  const [a,e]=await Promise.all([db.ref(`experimentalRecordingAnnotations/${station}`).once('value'),db.ref(`experimentalExperiments/${station}`).once('value')]);
+  const annotations=a.val()||{}, experiments=e.val()||{};
+  return records.map(r=>{const ann=annotations[r.session]?.[`tier${r.tier}`];const id=ann?.experimentId;return {...r,recordingName:ann?.name||'',experimentName:id?(experiments[id]?.name||'Unavailable experiment'):'No experiment'};});
 }
 
 const experimentWrites=new Map();
@@ -468,7 +475,7 @@ wss.on('connection', (ws,req)=>{
       }
 
       if(m.type==='list_recordings' && safeId(m.station)){
-        void listRecordings(m.station).then(records=>dashboardReply(ws,m.station,{type:'recordings_list',station:m.station,requestId:m.requestId??null,records,safe:deletionSafe(m.station)}))
+        void listRecordings(m.station).then(records=>libraryNames(m.station,records)).then(records=>dashboardReply(ws,m.station,{type:'recordings_list',station:m.station,requestId:m.requestId??null,records,safe:deletionSafe(m.station)}))
           .catch(e=>dashboardReply(ws,m.station,{type:'recordings_error',requestId:m.requestId??null,error:String(e.message||e).slice(0,180)}));return;
       }
       if(m.type==='get_recording_page' && safeId(m.station) && safeId(m.session) && [1,2,3].includes(m.tier)){
