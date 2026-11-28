@@ -19,7 +19,7 @@ const authDb = admin.database(authApp);
 
 // v0.16: Read-only, authenticated recording discovery and bounded retrieval.
 // The existing recording/persistence pipeline is intentionally unchanged.
-const SERVER_REVISION='v0.27_EXPERIMENTS'; // 2026-11-27_2044 ET
+const SERVER_REVISION='v0.27.1_EXPERIMENTS'; // 2026-11-27_2057 ET
 const MAX_LIST_SESSIONS=150;
 const MAX_PAGE_BATCHES=20;
 const MAX_PAGE_SAMPLES=2000;
@@ -369,7 +369,7 @@ wss.on('connection', (ws,req)=>{
         }catch(e){dashboardAuth.delete(ws);authFailure(ws,'renewal',e);ws.close(1008,'renewal rejected');}
         finally{authPending=false;}return;
       }
-      if(m.type==='experiment_create'||m.type==='experiment_list'){
+      if(['experiment_create','experiment_list','experiment_edit','experiment_delete'].includes(m.type)){
         const reply=(obj)=>dashboardReply(ws,m.station,{...obj,station:m.station,requestId:m.requestId});
         if(!authorized(ws,m.station)){send(ws,{type:'experiment_error',requestId:m.requestId,station:m.station,error:'station_not_authorized'});return;}
         try{
@@ -379,6 +379,15 @@ wss.on('connection', (ws,req)=>{
             const record={...fields,createdMs:Date.now(),createdBy:dashboardAuth.get(ws).uid};
             const child=ref.push();await child.set(record);
             reply({type:'experiment_created',id:child.key});
+          }else if(m.type==='experiment_edit'||m.type==='experiment_delete'){
+            if(typeof m.id!=='string'||!/^[-A-Za-z0-9_]{1,128}$/.test(m.id))throw Error('Invalid experiment ID');
+            const editing=m.type==='experiment_edit',fields=editing?validateExperiment(m):null;
+            const result=await ref.child(m.id).transaction(current=>{
+              if(!current||typeof current!=='object')return;
+              return editing?{...current,...fields}:null;
+            });
+            if(!result.committed)throw Error('Experiment no longer exists');
+            reply({type:editing?'experiment_edited':'experiment_deleted',id:m.id});
           }else{
             const snap=await ref.once('value');const records=[];
             snap.forEach(child=>{const v=child.val();records.push({id:child.key,name:v.name,question:v.question,description:v.description,createdMs:v.createdMs});});
