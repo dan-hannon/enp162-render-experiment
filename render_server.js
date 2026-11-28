@@ -19,7 +19,7 @@ const authDb = admin.database(authApp);
 
 // v0.16: Read-only, authenticated recording discovery and bounded retrieval.
 // The existing recording/persistence pipeline is intentionally unchanged.
-const SERVER_REVISION='v0.28.6_EXPERIMENT_EXPORT'; // 2026-11-27_2228 ET
+const SERVER_REVISION='v0.28.7_EXPORT_ELIGIBILITY'; // 2026-11-27_2237 ET
 const MAX_LIST_SESSIONS=150;
 const MAX_PAGE_BATCHES=20;
 const MAX_PAGE_SAMPLES=2000;
@@ -265,6 +265,20 @@ const deletionReady=db.ref('experimentalDeletions').once('value').then(snap=>{
 deletionReady.catch(e=>console.error('deletion_index_load_failed',String(e)));
 const deletionKey=(st,se,t)=>`${st}/${se}/tier${t}`;
 function deletionSafe(st){const d=devices.get(st), proof=idleProof.get(st);return !!d&&d.readyState===WebSocket.OPEN&&proof===d&&!queueSnapshot(st)&&!completionWrites.get(st)&&!deferredCompletion.has(st)&&!deleting.has(st);}
+// Read-only export eligibility; historical recordings require existing confirmed-idle proof.
+async function exportEligibility(st,session,tier){
+ const root=recordingRoot(st,session,tier);
+ const [completion,first]=await Promise.all([db.ref(`${root}/completion`).once('value'),db.ref(`${root}/batches/b00000000`).once('value')]);
+ const state=recordingStatus.get(st);
+ if(state?.session===session&&state.tier===tier&&['started','receiving','draining'].includes(state.state))throw Error('Recording is active or draining');
+ if(queueSnapshot(st)||completionWrites.get(st)||deferredCompletion.has(st))throw Error('Recording persistence is pending; try again after saving finishes');
+ if(deleting.has(st)||deletionKeys.has(deletionKey(st,session,tier))||!first.exists())throw Error('Recording is missing or being deleted');
+ const c=completion.val();
+ if(c?.completed===true)return {completed:true};
+ if(c?.completed===false)throw Error('Recording completion was explicitly unverified');
+ if(!deletionSafe(st))throw Error('Historical recording requires confirmed idle station; request a snapshot in Devices and retry');
+ return {completed:false};
+}
 function deletionStatus(st){emitToDashboards({type:'deletion_status',station:st,safe:deletionSafe(st)});}
 function invalidateIdle(st){idleProof.delete(st);idleRequests.delete(st);deletionStatus(st);}
 async function deleteRecordings(ws,m){
@@ -481,7 +495,7 @@ wss.on('connection', (ws,req)=>{
       }
       if(!authorized(ws,m.station)){
         if(dashboardAuth.get(ws)?.expiresMs<=Date.now()){ws.close(1008,'expired token');return;}
-        send(ws,{type:['list_recordings','get_recording_page','delete_recordings'].includes(m.type)?'recordings_error':'error',requestId:m.requestId??null,error:'station_not_authorized'});return;
+        send(ws,{type:['list_recordings','get_recording_page','delete_recordings','export_eligibility'].includes(m.type)?'recordings_error':'error',requestId:m.requestId??null,error:'station_not_authorized'});return;
       }
       if(m.type==='delete_recordings'){try{const results=await deleteRecordings(ws,m);dashboardReply(ws,m.station,{type:'deletion_result',requestId:m.requestId,results});}catch(e){dashboardReply(ws,m.station,{type:'recordings_error',requestId:m.requestId,error:e.message});}return;}
       if(m.type==='manage' && safeId(m.station) && safeId(m.requestId) && ['snapshot','application','transport','combined','restart','monitor_on','monitor_off','live_on','live_off'].includes(m.operation)){
@@ -492,6 +506,12 @@ wss.on('connection', (ws,req)=>{
         send(device,{type:'command',action:'manage',operation:m.operation,requestId:m.requestId});return;
       }
 
+      if(m.type==='export_eligibility' && safeId(m.station)){
+        try{if(!safeId(m.session)||![1,2,3].includes(m.tier))throw Error('Invalid recording identifier');
+          const result=await exportEligibility(m.station,m.session,m.tier);
+          dashboardReply(ws,m.station,{type:'export_eligibility_result',requestId:m.requestId,station:m.station,session:m.session,tier:m.tier,...result});
+        }catch(e){dashboardReply(ws,m.station,{type:'recordings_error',requestId:m.requestId,error:e.message});}return;
+      }
       if(m.type==='list_recordings' && safeId(m.station)){
         void listRecordings(m.station).then(records=>libraryNames(m.station,records)).then(records=>dashboardReply(ws,m.station,{type:'recordings_list',station:m.station,requestId:m.requestId??null,records,safe:deletionSafe(m.station)}))
           .catch(e=>dashboardReply(ws,m.station,{type:'recordings_error',requestId:m.requestId??null,error:String(e.message||e).slice(0,180)}));return;
