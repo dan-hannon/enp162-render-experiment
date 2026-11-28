@@ -19,7 +19,7 @@ const authDb = admin.database(authApp);
 
 // v0.16: Read-only, authenticated recording discovery and bounded retrieval.
 // The existing recording/persistence pipeline is intentionally unchanged.
-const SERVER_REVISION='v0.27.3_EXPERIMENTS'; // 2026-11-27_2115 ET
+const SERVER_REVISION='v0.28_ANNOTATIONS'; // 2026-11-27_2135 ET
 const MAX_LIST_SESSIONS=150;
 const MAX_PAGE_BATCHES=20;
 const MAX_PAGE_SAMPLES=2000;
@@ -375,6 +375,29 @@ wss.on('connection', (ws,req)=>{
           dashboardAuth.set(ws,a);netLog('net_auth_renewed',ws);send(ws,{type:'auth_renewed',expiresMs:a.expiresMs});
         }catch(e){dashboardAuth.delete(ws);authFailure(ws,'renewal',e);ws.close(1008,'renewal rejected');}
         finally{authPending=false;}return;
+      }
+      if(['annotation_get','annotation_save'].includes(m.type)){
+        const reply=obj=>dashboardReply(ws,m.station,{...obj,station:m.station,session:m.session,tier:m.tier,requestId:m.requestId});
+        if(!authorized(ws,m.station)){send(ws,{type:'annotation_error',station:m.station,session:m.session,tier:m.tier,requestId:m.requestId,error:'station_not_authorized'});return;}
+        try{
+          if(!safeId(m.session)||![1,2,3].includes(m.tier))throw Error('Invalid recording identifier');
+          const key=deletionKey(m.station,m.session,m.tier);
+          const ref=db.ref(`experimentalRecordingAnnotations/${key}`);
+          if(!(await db.ref(`${recordingRoot(m.station,m.session,m.tier)}/batches/b00000000`).once('value')).exists())throw Error('Recording not found');
+          if(m.type==='annotation_save'){
+            if(typeof m.name!=='string'||m.name.length>200||typeof m.notes!=='string'||m.notes.length>4000)throw Error('Invalid annotation fields');
+            if(!authorized(ws,m.station)||deleting.has(m.station)||deletionKeys.has(key))throw Error('Recording unavailable');
+            const value={name:m.name.trim(),notes:m.notes.trim()};
+            await ref.set(value);
+            const confirmed=(await ref.once('value')).val();
+            if(!confirmed||confirmed.name!==value.name||confirmed.notes!==value.notes)throw Error('Annotation save not confirmed');
+            reply({type:'annotation_result',annotation:confirmed});
+          }else{
+            const value=(await ref.once('value')).val();
+            reply({type:'annotation_result',annotation:value||{name:'',notes:''}});
+          }
+        }catch(e){reply({type:'annotation_error',error:String(e.message||e).slice(0,160)});}
+        return;
       }
       if(['experiment_create','experiment_list','experiment_edit','experiment_delete'].includes(m.type)){
         const reply=(obj)=>dashboardReply(ws,m.station,{...obj,station:m.station,requestId:m.requestId});
