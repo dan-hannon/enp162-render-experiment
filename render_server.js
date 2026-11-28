@@ -19,7 +19,7 @@ const authDb = admin.database(authApp);
 
 // v0.16: Read-only, authenticated recording discovery and bounded retrieval.
 // The existing recording/persistence pipeline is intentionally unchanged.
-const SERVER_REVISION='v0.28_ANNOTATIONS'; // 2026-11-27_2135 ET
+const SERVER_REVISION='v0.28.1_ASSOCIATIONS'; // 2026-11-27_2145 ET
 const MAX_LIST_SESSIONS=150;
 const MAX_PAGE_BATCHES=20;
 const MAX_PAGE_SAMPLES=2000;
@@ -387,10 +387,14 @@ wss.on('connection', (ws,req)=>{
           if(m.type==='annotation_save'){
             if(typeof m.name!=='string'||m.name.length>200||typeof m.notes!=='string'||m.notes.length>4000)throw Error('Invalid annotation fields');
             if(!authorized(ws,m.station)||deleting.has(m.station)||deletionKeys.has(key))throw Error('Recording unavailable');
-            const value={name:m.name.trim(),notes:m.notes.trim()};
+            const experimentId=m.experimentId??'';
+            if(typeof experimentId!=='string'||(experimentId&&!/^[-A-Za-z0-9_]{1,128}$/.test(experimentId)))throw Error('Invalid experiment ID');
+            if(experimentId&&!(await db.ref(`experimentalExperiments/${m.station}/${experimentId}`).once('value')).exists())throw Error('Experiment not found for this station');
+            if(!authorized(ws,m.station)||deleting.has(m.station)||deletionKeys.has(key))throw Error('Recording unavailable');
+            const value={name:m.name.trim(),notes:m.notes.trim(),experimentId};
             await ref.set(value);
             const confirmed=(await ref.once('value')).val();
-            if(!confirmed||confirmed.name!==value.name||confirmed.notes!==value.notes)throw Error('Annotation save not confirmed');
+            if(!confirmed||confirmed.name!==value.name||confirmed.notes!==value.notes||confirmed.experimentId!==value.experimentId)throw Error('Annotation save not confirmed');
             reply({type:'annotation_result',annotation:confirmed});
           }else{
             const value=(await ref.once('value')).val();
